@@ -5,7 +5,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
-from contextlib import AsyncExitStack
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass
 
 from verifiers.v1.clients import ModelContext
@@ -79,6 +79,7 @@ class Rollout:
         self._interception = interception
         self.runtime = runtime
         self._owns_runtime = runtime is None
+        self._scoring_runtime: AbstractAsyncContextManager[Runtime] | None = None
         self.trace: Trace = Trace(
             task=TraceTask(
                 type=type(task).__name__,
@@ -174,6 +175,19 @@ class Rollout:
                     "task has no prompt and no user to open the conversation; set "
                     "task.prompt, or drive the run through agent.interaction() and open "
                     "it with the first turn(message)"
+                )
+            # Resolved before the box boots so an impossible pairing costs nothing.
+            self._scoring_runtime = self.task.scoring_runtime(
+                runtime, self.trace.agent.config.runtime
+            )
+            if self._scoring_runtime is not None and (
+                not self._owns_runtime or self._shared_tools
+            ):
+                raise TaskError(
+                    f"task {type(self.task).__name__} scores in its own box, which "
+                    "needs this rollout to own the agent's (a borrowed one is its "
+                    "creator's to tear down) and to have no shared tool servers "
+                    "(they outlive the box)"
                 )
             if self._owns_runtime:
                 await runtime.start()
@@ -358,13 +372,25 @@ class Rollout:
                 trace.timing.scoring.start = now
                 async with boundary(TaskError, "scoring"):
                     # Cross-trace judgement runs later, after the runtime is gone.
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            self.task.score(trace, runtime),
-                            self.harness.score(trace, runtime),
-                        ),
-                        self._timeouts.scoring,
-                    )
+                    if self._scoring_runtime is None:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                self.task.score(trace, runtime),
+                                self.harness.score(trace, runtime),
+                            ),
+                            self._timeouts.scoring,
+                        )
+                    else:
+                        # Serial, not gathered: the harness's metrics describe the
+                        # agent's own session, so they are read off the agent's box
+                        # before the task's context manager tears it down. The task's
+                        # box is provisioned inside the scoring deadline — a grader
+                        # that can't be reached in time is a scoring timeout, not a
+                        # zero.
+                        async with asyncio.timeout(self._timeouts.scoring):
+                            await self.harness.score(trace, runtime)
+                            async with self._scoring_runtime as scoring_box:
+                                await self.task.score(trace, scoring_box)
                 trace.timing.scoring.end = time.time()
         except Exception as e:  # noqa: BLE001 - finalize boundary records every rollout failure
             self.fail(e)
@@ -382,7 +408,9 @@ class Rollout:
                 if span.start and not span.end:
                     span.end = now
             trace.split_agent_time()
-            if runtime is not None:
+            # A task that scores in its own box tears the agent's down to get there, so
+            # there is nothing left to clean up in it.
+            if runtime is not None and not runtime.stopped:
                 try:
                     await self.harness.cleanup(trace, runtime)
                 except Exception:
