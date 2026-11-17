@@ -10,8 +10,9 @@ tighter type contract. `import verifiers.v1 as vf`.
 - **Composable taskset × harness** — a taskset (data + scoring) is fully decoupled from the
   harness (the program driving the rollout); any taskset runs under any harness
   (`default` / `rlm` / `codex` / your own)
-- **Swappable runtime** — the harness, tools, and user simulators all run behind one
-  `Runtime` contract, in `subprocess` / `docker` / `prime` / `modal` / ...
+- **Swappable, lazy runtime** — sandboxed execution runs behind one `Runtime` contract in
+  `docker` / `prime`, provisioned lazily on first use so pure-chat, judge-scored,
+  user-simulated, and host-MCP rollouts spawn no container or sandbox at all.
 - **First-class branching rollouts** — a rollout isn't assumed linear: context compaction and
   subagents are native. Each branch (a root→leaf path through the trace graph) is its own
   training sample, so a compacting or multi-agent rollout trains end to end.
@@ -40,7 +41,7 @@ uv sync --python 3.12 --extra harbor
 
 ```bash
 uv run init my-task-v1           # scaffold a new environment (--add-tool/--add-user/--add-harness)
-uv run eval gsm8k-v1 -n 5 -r 3   # single-turn math; default harness; subprocess runtime
+uv run eval gsm8k-v1 -n 5 -r 3 --harness.id null  # single-turn math; no sandbox spawned
 uv run validate gsm8k-v1 -n 5    # model-free: run each task's gold check (the `validate` hook)
 uv run eval -h                   # typed help (+ the local example tasksets/harnesses)
 ```
@@ -75,8 +76,8 @@ Taskset examples (the `*_v1` packages under `environments/`):
 | example | pattern it shows |
 | --- | --- |
 | `reverse-text-v1` | the minimal single-turn taskset |
-| `gsm8k-v1` | single-turn + in-runtime scoring |
-| `code-golf-v1` | group rewards (`@group_reward` over a task's N rollouts) |
+| `gsm8k-v1` | single-turn math (`vf.verify_boxed_math_answer`) |
+| `code-golf-v1` | group rewards (`@group_reward` over a task's N rollouts) + sandboxed execution |
 | `alphabet-sort-v1` | a multi-turn, stateful task driven by a `vf.User` simulator |
 | `glossary-v1` | a custom **colocated** tool server |
 | `wiki-search-v1` | a **shared** tool server (built once for the eval) + an LLM judge |
@@ -103,27 +104,27 @@ uv run eval gsm8k-v1 -n 1 --harness.id codex  # the codex harness
 ```
 
 The same drivers on an agentic terminal task — harbor's `hello-world`. The task acts on a
-filesystem, so run it under a containerized runtime: `docker` locally, or a remote `prime` /
-`modal` sandbox (not the default `subprocess`). 
+filesystem, so it provisions a container runtime (`docker` locally by default, or a remote
+`prime` sandbox).
 
 ```bash
-uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.runtime.type docker --harness.id default         # the bash + edit agent
-uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.runtime.type docker --harness.id mini-swe-agent  # the mini-swe-agent CLI
-uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.runtime.type docker --harness.id rlm             # the rlm CLI agent
-uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.runtime.type docker --harness.id codex           # the codex CLI agent
+uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.id default         # the bash + edit agent
+uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.id mini-swe-agent  # the mini-swe-agent CLI
+uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.id rlm             # the rlm CLI agent
+uv run eval harbor -n 1 --taskset.ignore-dockerfile --harness.id codex           # the codex CLI agent
 ```
 
 ### Swappable runtime
 
-Where code runs, behind one `Runtime` contract — the same contract backs the harness
-(`--harness.runtime`), a task's own tool servers (`--taskset.tools.runtime`), and the user
-simulator (`--taskset.user.runtime`) — all structurally MCP servers in a runtime:
+Where sandboxed code runs, behind one `Runtime` contract — the same contract backs the harness
+(`--harness.runtime`), isolated tool servers (`--taskset.tools.runtime`), and isolated user
+simulators (`--taskset.user.runtime`). Runtimes provision lazily on first use, so rollouts that
+never touch a container/sandbox (`null` harness, or `default` when the model makes no `bash`/`edit`
+calls) spawn nothing:
 
 ```bash
-uv run eval gsm8k-v1 -n 1 --harness.runtime.type subprocess  # local process (default)
-uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container (requires local docker)
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container (default)
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type prime       # remote prime sandbox (requires auth)
-uv run eval gsm8k-v1 -n 1 --harness.runtime.type modal       # remote modal sandbox (requires auth)
 ```
 
 The framework manages each runtime's full lifecycle — provisioning through

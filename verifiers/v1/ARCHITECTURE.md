@@ -28,13 +28,12 @@ simulator — is invisible to the harness, which stays a plain program.
 ```
 Episode (task, n)
 └─ Rollout.run()                              # rollout.py, one asyncio.Task per rollout
-   ├─ runtime.start()                         # provision workspace / container / sandbox
    ├─ taskset.setup(task, runtime)            # Phase.SETUP   — wait_for(setup_timeout)
    ├─ harness.run(ctx, trace, runtime, …)     # Phase.RUNNING — wait_for(rollout_timeout)
    │     └─ model calls → interception server → client → graph.add_turn()
    ├─ taskset.finalize(task, trace, runtime)  # Phase.FINALIZE— wait_for(finalize_timeout)
    ├─ taskset.score + harness.score           # Phase.SCORING — wait_for(scoring_timeout)
-   └─ runtime.stop()                          # guaranteed teardown (also atexit-guarded)
+   └─ runtime.stop()                          # tears down container/sandbox if provisioned
    ⤷ Episode then runs @group_reward across the task's N traces
 ```
 
@@ -42,7 +41,7 @@ Each stage is bounded by its own `asyncio.wait_for` (`rollout.py`), so a wedge i
 phase is a budget event, not a hang — a `harness_timeout` scores what's there; a
 `finalize`/`scoring` timeout errors the rollout. Defaults are no-limit, so production configs
 set `TimeoutConfig` explicitly. Per-call retries are owned by the SDKs (the harness's model SDK,
-the prime/modal runtime SDKs); the framework keeps only whole-rollout retries
+the prime runtime SDK); the framework keeps only whole-rollout retries
 (`retries.py::run_with_retry` — re-run if the trace ends in a retryable error type). Per-rollout
 budgets (`RolloutLimits`) are checked between turns.
 
@@ -146,25 +145,30 @@ thousands of servers or tunnels.
 
 ## Runtimes
 
-A `Runtime` (`runtimes/base.py`) is the single contract for *where* code runs:
+A `Runtime` (`runtimes/base.py`) is the single contract for *where* isolated code runs:
 `start`/`stop`/`cleanup`, `run(argv, env)` and `run_background(...)`, `run_uv_script(...)`,
 `read`/`write`, and `expose(port)` (the URL by which the host reaches a port inside the
-runtime — localhost for subprocess, a tunnel for prime/modal). The same contract backs the
-harness, a task's tool servers, and the user simulator, so any of them runs in any backend:
-`subprocess` (local, `/tmp/<name>` workspace, own process group), `docker` (local container),
-`prime` (remote sandbox), `modal` (remote function).
+runtime — localhost for `docker`, a tunnel for `prime`). Backends are `docker` (local
+container, the default) and `prime` (remote Prime sandbox);
+there is no host-subprocess runtime, so untrusted agent commands never execute directly on the
+host machine.
 
-Resources are named after the rollout id (greppable) and their teardown is guaranteed: a live
-runtime registers in a `WeakSet`, and an `atexit` hook reaps anything a signal-interrupted
-`finally` didn't. `run_uv_script` runs a PEP 723 single-file script with inline deps — the unit
-tools and in-runtime scoring are built from, so a dependency (a tool server, a `math-verify`
-scorer) never touches the eval process. (The subprocess runtime resolves each script's
-interpreter once and caches it, keeping `uv` off the per-rollout hot path.)
+Runtimes provision **lazily on first use**: `Rollout.run` creates the `Runtime` handle up front
+without booting a container, and the first `run` / `run_background` / `read` / `write` /
+`expose` call triggers `start()`. Built-in chat harnesses (`null`, `default`) drive the model
+and MCP loop in-process on the host (`RUNS_ON_HOST = True`), delegating only `bash` and `edit`
+tool calls into `runtime`. Consequently, single-turn math, judge-scored, user-simulated, and
+host-MCP rollouts spawn zero containers, sandboxes, or tunnels.
 
-Tools and the user simulator are structurally the same thing — an MCP server launched in a
-runtime and reached over the resolved URL. Placement (colocated in the harness's runtime, its
-own per-rollout runtime, a shared one built once, or an existing remote) is config, and
-reachability is resolved automatically.
+Provisioned resources are named after the rollout id (greppable) and their teardown is
+guaranteed: a started runtime registers in a `WeakSet`, and an `atexit` hook reaps anything a
+signal-interrupted `finally` didn't. `run_uv_script` runs a PEP 723 single-file script with
+inline deps inside the container/sandbox.
+
+Tools and the user simulator are structurally the same thing — an MCP server reached over a
+resolved URL. By default (`runtime = None`) they run in-process on the host event loop; setting
+`colocated = True` places them inside the harness's runtime, setting `runtime` isolates them in
+their own container/sandbox, and `shared = True` serves one instance across the whole eval.
 
 ## Serving — the orchestrator interface
 
@@ -221,7 +225,7 @@ data, not a crash. The whole model is four mechanisms, each in one place (`error
 
 Retries: per-call faults are retried by the SDKs themselves — the harness's model SDK (the
 interception server is a faithful proxy: it relays the provider's status code so the SDK retries
-5xx/429/timeout and not 4xx) and the prime/modal runtime SDKs. The framework adds targeted retries
+5xx/429/timeout and not 4xx) and the prime runtime SDK. The framework adds targeted retries
 only where no SDK retries underneath (e.g. `open_tunnel`, via the shared `retrying()` policy). On top
 sits whole-rollout `run_with_retry` (`retries.py`), which reruns a trajectory whose trace ends with a
 retryable error (`--retries.rollout.include` matches by type name); off by default.

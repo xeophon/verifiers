@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, TypeVar
 from pydantic_config import BaseConfig
 
 from verifiers.v1.mcp.server import ServerBase
-from verifiers.v1.runtimes import RuntimeConfig, SubprocessConfig
+from verifiers.v1.runtimes import RuntimeConfig
 from verifiers.v1.state import StateT
 from verifiers.v1.types import Messages
 
@@ -29,16 +29,17 @@ if TYPE_CHECKING:
 
 class UserConfig(BaseConfig):
     """Where the user simulator runs (placement). The framework always drives it from the host.
-    Default — its own host (`subprocess`) runtime — runs it where `verifiers` + the env module
-    already live, reachable from any harness runtime (nothing to fetch). Set `colocated` to run it
-    inside the harness's runtime instead (in a sandbox that uploads + installs the env package, a
-    per-rollout cost). Subclass to add the user's own knobs (the data its `respond` reads)."""
+    Default (`runtime=None`, `colocated=False`) runs it in-process on the host where `verifiers` +
+    the env module already live, with no container or subprocess spawned. Set `colocated` to run it
+    inside the harness's runtime instead, or `runtime` (`docker` / `prime`) to isolate it
+    in its own sandbox. Subclass to add the user's own knobs (the data its `respond` reads)."""
 
     colocated: bool = False
     """Run the user simulator inside the harness's runtime, reusing it (its port is published
     back to the host so the framework can still drive it). Off by default — see `ToolsetConfig`."""
-    runtime: RuntimeConfig = SubprocessConfig()
-    """The user simulator's own runtime, used unless `colocated` (host/subprocess by default)."""
+    runtime: RuntimeConfig | None = None
+    """An isolated container/sandbox runtime for the user simulator, used unless `colocated`
+    (`None` by default — runs in-process on the host)."""
 
 
 ConfigT = TypeVar("ConfigT", bound=UserConfig)

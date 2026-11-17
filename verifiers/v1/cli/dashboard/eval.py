@@ -118,15 +118,6 @@ def _aligned(rows: list[list[str]]) -> list[str]:
 
 
 def _warning(config: EvalConfig) -> Text | None:
-    """A local-runtime caution for a code-running harness (none for the tool-less `null`),
-    shown above the overview rather than as a row in it."""
-    if config.harness.id != "null" and config.harness.runtime.type == "subprocess":
-        return Text(
-            "warning  Runs on the local system; local files and settings may affect this "
-            "evaluation. Use subprocess only for debugging, or use docker or prime for an "
-            "isolated run.",
-            style="yellow",
-        )
     return None
 
 
@@ -157,7 +148,7 @@ def overrides(
             child_skip = frozenset(
                 s[len(field) + 1 :] for s in skip if s.startswith(f"{field}.")
             )
-            # A switched discriminator (e.g. subprocess→docker) is an override the per-field diff
+            # A switched discriminator (e.g. docker→prime) is an override the per-field diff
             # misses — within the new class `type` equals its own default — so surface it.
             class_changed = type(value) is not type(field_def)
             if (

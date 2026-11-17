@@ -12,18 +12,17 @@ runtime (`user_runtime` / `tool_runtime`).
 
 Every matrix value carries a pytest mark, so subsets select with `-m`:
 
-    uv run pytest tests/v1 -n auto                                # the whole matrix (needs modal setup)
-    uv run pytest tests/v1 -n auto -m "not prime and not modal"  # the CI matrix (host + docker only)
-    uv run pytest tests/v1 -n auto -m docker                      # any case touching the docker runtime
-    uv run pytest tests/v1 -n auto -m default                     # only the default harness
-    uv run pytest tests/v1 -n auto -m prime                       # only prime (real sandboxes; local)
-    uv run pytest tests/v1 -n auto -m modal                       # only modal (needs local setup)
+    uv run pytest tests/v1 -n auto                        # the whole matrix (includes prime)
+    uv run pytest tests/v1 -n auto -m "not prime"         # the CI matrix (host + docker only)
+    uv run pytest tests/v1 -n auto -m docker              # any case touching the docker runtime
+    uv run pytest tests/v1 -n auto -m default             # only the default harness
+    uv run pytest tests/v1 -n auto -m prime               # only prime (real sandboxes; local)
 
-Marks: runtimes `subprocess` / `docker` / `prime` / `modal`, placements `colocated` / `shared`,
+Marks: runtimes `docker` / `prime`, placements `host` / `colocated` / `shared`,
 harnesses `null` / `default` / `rlm` / `kimi_code` / `codex`. A mark is applied per axis, so it
 selects every case touching that value on ANY axis; for one exact combination use `-k` on the test
-id (e.g. `-k "harness-in-docker-with-tool-in-subprocess"`). prime/modal provision real remote
-sandboxes (slow, infra-flaky, need setup), so they're local-only — CI runs `-m "not prime and not modal"`.
+id (e.g. `-k "harness-in-docker-with-tool-on-host"`). prime provisions real remote
+sandboxes (slow, infra-flaky, needs auth), so it's local-only — CI runs `-m "not prime"`.
 """
 
 import os
@@ -41,17 +40,12 @@ from verifiers.v1.trace import Trace
 # v0 legacy bridge both resolve them by id (no install).
 
 # The harness runtime. Each value carries its runtime mark so a subset can be selected
-# (`-m docker`, `-m "not prime"`, ...). docker needs the daemon; prime/modal provision real remote
-# sandboxes (slow, infra-flaky, need setup), so they're local-only — CI runs `-m "not prime and
-# not modal"`. The `id`s make a test read like `<harness>-harness-in-<rt>` /
-# `harness-in-<rt>-with-<user|tool>-...`.
+# (`-m docker`, `-m "not prime"`, ...). docker needs the daemon; prime provisions real remote
+# sandboxes (slow, infra-flaky, needs auth), so it's local-only — CI runs `-m "not prime"`.
+# The `id`s make a test read like `<harness>-harness-in-<rt>` / `harness-in-<rt>-with-<user|tool>-...`.
 HARNESS_RUNTIMES = [
-    pytest.param(
-        "subprocess", marks=pytest.mark.subprocess, id="harness-in-subprocess"
-    ),
     pytest.param("docker", marks=pytest.mark.docker, id="harness-in-docker"),
     pytest.param("prime", marks=pytest.mark.prime, id="harness-in-prime"),
-    pytest.param("modal", marks=pytest.mark.modal, id="harness-in-modal"),
 ]
 
 
@@ -60,47 +54,45 @@ def harness_runtime(request) -> str:
     return request.param
 
 
-# The user simulator's runtime: inside the harness's runtime (`colocated`) or its own runtime; this
-# fans the user test across both, each carrying its placement/runtime mark.
+# The user simulator's placement: in-process on the host (`host`, default), inside the harness's
+# runtime (`colocated`), or its own isolated runtime (`docker` / `prime`).
 USER_RUNTIMES = [
+    pytest.param("host", marks=pytest.mark.host, id="with-user-on-host"),
     pytest.param("colocated", marks=pytest.mark.colocated, id="with-user-colocated"),
-    pytest.param(
-        "subprocess", marks=pytest.mark.subprocess, id="with-user-in-subprocess"
-    ),
     pytest.param("docker", marks=pytest.mark.docker, id="with-user-in-docker"),
     pytest.param("prime", marks=pytest.mark.prime, id="with-user-in-prime"),
-    pytest.param("modal", marks=pytest.mark.modal, id="with-user-in-modal"),
 ]
 
 
 @pytest.fixture(params=USER_RUNTIMES)
 def user_runtime(request) -> dict:
-    """A `taskset.user` override placing the user simulator: `colocated` (inside the harness's
-    runtime) or its own runtime, by type."""
+    """A `taskset.user` override placing the user simulator: in-process on the host (`host`),
+    `colocated` (inside the harness's runtime), or its own isolated runtime, by type."""
+    if request.param == "host":
+        return {"colocated": False, "runtime": None}
     if request.param == "colocated":
         return {"colocated": True}
     return {"colocated": False, "runtime": {"type": request.param}}
 
 
-# The tool server's runtime: inside the harness's runtime (`colocated`), shared once per eval, or its
-# own runtime per rollout; this fans the tool test across all of them, each carrying its
-# placement/runtime mark (colocated/shared use the host subprocess runtime).
+# The tool server's placement: in-process on the host (`host`, default), inside the harness's
+# runtime (`colocated`), shared once per eval (`shared`), or its own isolated runtime.
 TOOL_RUNTIMES = [
+    pytest.param("host", marks=pytest.mark.host, id="with-tool-on-host"),
     pytest.param("colocated", marks=pytest.mark.colocated, id="with-tool-colocated"),
     pytest.param("shared", marks=pytest.mark.shared, id="with-tool-shared"),
-    pytest.param(
-        "subprocess", marks=pytest.mark.subprocess, id="with-tool-in-subprocess"
-    ),
     pytest.param("docker", marks=pytest.mark.docker, id="with-tool-in-docker"),
     pytest.param("prime", marks=pytest.mark.prime, id="with-tool-in-prime"),
-    pytest.param("modal", marks=pytest.mark.modal, id="with-tool-in-modal"),
 ]
 
 
 @pytest.fixture(params=TOOL_RUNTIMES)
 def tool_runtime(request) -> dict:
-    """A `taskset.tools` override placing the tool server: `colocated` (inside the harness's
-    runtime), `shared` (one instance for the whole eval), or its own runtime, by type."""
+    """A `taskset.tools` override placing the tool server: in-process on the host (`host`),
+    `colocated` (inside the harness's runtime), `shared` (one instance for the whole eval), or its
+    own isolated runtime, by type."""
+    if request.param == "host":
+        return {"runtime": None}
     if request.param == "colocated":
         return {"colocated": True}
     if request.param == "shared":

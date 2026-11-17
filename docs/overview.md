@@ -52,7 +52,6 @@ Optional features are installed with extras:
 
 | Extra | Install | Enables |
 | --- | --- | --- |
-| `modal` | `uv add "verifiers[modal]"` | The v1 Modal sandbox runtime |
 | `notebook` | `uv add "verifiers[notebook]"` | `Environment.generate_sync()` inside Jupyter or another active event loop |
 | `quest` | `uv add "verifiers[quest]"` | QUEST PDF parsing and evaluation |
 

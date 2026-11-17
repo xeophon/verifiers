@@ -1,8 +1,8 @@
 """Whole-rollout retries (per-call model/runtime retries are owned by the SDKs, not us).
 
 Transient model-call faults are retried by the harness's own SDK (the interception server is a
-faithful proxy — it relays the provider's status), and transient runtime faults by each runtime
-SDK (prime/modal); the framework adds targeted retries only where there's no SDK underneath (e.g.
+faithful proxy — it relays the provider's status), and transient runtime faults by the runtime
+SDK (prime); the framework adds targeted retries only where there's no SDK underneath (e.g.
 `open_tunnel`, via the shared `retrying()` policy). `RetryConfig` (on `EnvConfig.retries`) keeps one
 knob: whole-rollout retries. `run_with_retry` reruns an entire trajectory when its trace ends with a
 retryable error (matched by exception type name against include/exclude), accumulating each failed

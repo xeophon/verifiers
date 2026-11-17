@@ -14,7 +14,7 @@ from verifiers.v1.types import Messages, StrictBaseModel
 
 
 class TaskResources(StrictBaseModel):
-    """Runtime resources a task requests (all optional), in Modal's units. Applied to the
+    """Runtime resources a task requests (all optional). Applied to the
     runtime config where the field exists; a field the runtime doesn't support is warned
     about and ignored. Precedence: cli/toml > task > the runtime default (`None` here =
     use the runtime/provider default)."""
@@ -28,7 +28,7 @@ class TaskResources(StrictBaseModel):
     gpu: str | None = None
     """GPU spec, e.g. "A100" or "A100:2" (type[:count])."""
     disk: float | None = None
-    """Disk in GB (enforced by prime; advisory on docker/modal)."""
+    """Disk in GB (enforced by prime; advisory on docker)."""
 
 
 class TaskTimeout(StrictBaseModel):
@@ -72,8 +72,7 @@ class Task(StrictBaseModel):
     warning). See `Harness.resolve_prompt`."""
     image: str | None = None
     """Container image this task needs (e.g. its harbor environment). When set, the
-    runtime must be a container (docker/prime): the Environment injects it into the
-    runtime config and refuses the subprocess runtime, which has no container."""
+    Environment injects it into the runtime config (`docker` / `prime`)."""
     workdir: str | None = None
     """Working directory the harness and scoring run in — the Environment injects it into
     the runtime config's `workdir` (where the runtime supports one). For a containerized

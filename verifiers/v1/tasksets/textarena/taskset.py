@@ -3,20 +3,19 @@
 Each task is one episode of a TextArena game (the working example is Wordle). The model
 plays by emitting moves; the framework's interception server drives a `vf.User` (the game
 engine, `TextArenaUser` below) that replies with the game's feedback as a user turn — so a whole
-game is one rollout of alternating assistant/user turns, and the harness/program never see
-the simulator. The user simulator runs colocated in the harness's runtime (host-reachable
-for the subprocess/docker runtimes), so this taskset uses the subprocess runtime.
+game is one rollout of alternating assistant/user turns, and the harness never sees the
+simulator. By default the user simulator runs in-process on the host (`UserConfig()`), spawning
+no container or sandbox.
 
-Scoring is game-authoritative: when the episode ends the user simulator writes the game's
-own outcome (`env.state.rewards`) to `OUTCOME_FILE` in the runtime, and the reward reads it
-back — so the taskset needs no per-game guess parsing. Each task is reproduced from an RNG
-seed (carried in `info`): the taskset seeds the game to build the prompt and the
-simulator re-seeds to the same episode, so no per-game word-list or state-key knowledge is
-needed and any single-player TextArena game fits.
+Scoring is game-authoritative: when the episode ends the user simulator records the game's
+own outcome (`env.state.rewards`) onto `self.state.reward`, which `game_reward` reads off
+`trace.state` — so the taskset needs no per-game guess parsing or container filesystem. Each
+task is reproduced from an RNG seed (carried in `info`): the taskset seeds the game to build
+the prompt and the simulator re-seeds to the same episode, so no per-game word-list or
+state-key knowledge is needed and any single-player TextArena game fits.
 """
 
 import copy
-import json
 import random
 from typing import Literal
 
@@ -37,28 +36,19 @@ SYSTEM_PROMPT = (
     "bracketed token, so don't put other words in brackets."
 )
 
-OUTCOME_FILE = "textarena_outcome.json"
-
 
 class TextArenaState(vf.State):
     game_over: bool = False
+    reward: float = 0.0
 
 
 class TextArenaUser(vf.User[vf.UserConfig, TextArenaState]):
     """The TextArena game engine as a framework-driven conversation partner. Holds one game in
     memory (set up from the task's `game` id + RNG `seed`, reproducing the taskset's episode) and,
     per `respond`, steps the game with the model's move and returns the next observation as a user
-    turn plus whether the episode is over. When the game ends it writes the game's own outcome to
-    `OUTCOME_FILE` in the runtime, which the reward reads back."""
+    turn. When the game ends it records the game's own outcome onto `self.state.reward`."""
 
     async def setup(self) -> None:
-        if not self.config.colocated:
-            raise ValueError(
-                "textarena's user simulator must be colocated: it hands the game outcome to scoring "
-                "by writing OUTCOME_FILE into the harness's runtime workspace that `game_reward` reads "
-                "back, so a non-colocated user (its own workspace) would always score 0. Set "
-                "`--taskset.user.colocated true` (the default)."
-            )
         import nltk
 
         nltk.download("words", quiet=True)
@@ -87,8 +77,6 @@ class TextArenaUser(vf.User[vf.UserConfig, TextArenaState]):
         )
 
     async def respond(self, message: str) -> vf.Messages:
-        import json
-
         env = self.env
         env.step(
             message
@@ -96,8 +84,7 @@ class TextArenaUser(vf.User[vf.UserConfig, TextArenaState]):
         if env.state.done:
             reward = float((env.state.rewards or {}).get(0, 0.0))
             reason = str(env.state.game_info[0]["reason"])
-            with open(OUTCOME_FILE, "w") as f:
-                json.dump({"reward": reward, "reason": reason}, f)
+            self.state.reward = reward
             self.state.game_over = True
             return [{"role": "user", "content": reason}]
         _, observation = env.get_observation()
@@ -117,10 +104,8 @@ class TextArenaConfig(vf.TasksetConfig):
     target), and WordSearch (find words in a grid)."""
     num_tasks: int = 1000
     """How many seeded episodes to generate; the eval/orchestrator selects from these."""
-    user: vf.UserConfig = vf.UserConfig(colocated=True)
-    """Colocated is required, not a default: the simulator hands the game outcome to scoring by
-    writing `OUTCOME_FILE` into the runtime workspace that `game_reward` reads back, so it must share
-    the harness's runtime/workdir (a non-colocated user runs in its own workspace → reward always 0)."""
+    user: vf.UserConfig = vf.UserConfig()
+    """Where the TextArena user simulator runs (in-process on the host by default)."""
 
 
 class TextArenaTask(vf.Task):
@@ -166,16 +151,8 @@ class TextArenaTaskset(vf.Taskset[TextArenaTask, TextArenaConfig, TextArenaState
         return TextArenaUser(self.config.user)
 
     @vf.reward(weight=1.0)
-    async def game_reward(
-        self, task: TextArenaTask, trace: vf.Trace, runtime: vf.Runtime
-    ) -> float:
-        # The simulator wrote the game's own outcome to the runtime when the episode ended;
-        # a missing file means the game never finished (e.g. every move was invalid).
-        try:
-            data = await runtime.read(OUTCOME_FILE)
-        except (FileNotFoundError, OSError):
-            return 0.0
-        return float(json.loads(data)["reward"])
+    async def game_reward(self, trace: vf.Trace) -> float:
+        return trace.state.reward
 
 
 if __name__ == "__main__":

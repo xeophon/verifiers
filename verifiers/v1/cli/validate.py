@@ -1,10 +1,10 @@
-"""The validate entrypoint: `uv run validate <taskset-id> [--runtime.type subprocess] [options]`.
+"""The validate entrypoint: `uv run validate <taskset-id> [--runtime.type docker|prime] [options]`.
 
 Registered as the `validate` console script — the model-free sibling of `eval`. Where `eval`
 runs a model rollout per task, `validate` runs each task's `validate` hook: a per-task check
 that the ground truth holds (a SWE row's gold patch makes its tests pass, gsm8k's verifier
-accepts the gold answer), in a runtime with the taskset's `setup` already applied. Each task
-is provisioned, set up, validated, and torn down independently with bounded concurrency.
+accepts the gold answer), with a lazily provisioned runtime and the taskset's `setup` applied.
+Tasks whose `setup` + `validate` never touch the runtime spawn no container or sandbox.
 
 Fire-and-forget: progress is shown live (the `--rich` dashboard, or per-task log lines) and
 nothing is written to disk.
@@ -39,7 +39,7 @@ from verifiers.v1.trace import Trace
 logger = logging.getLogger(__name__)
 
 USAGE = (
-    "usage: uv run validate [<taskset-id>] [--runtime.type subprocess] [options] [@ file.toml]\n"
+    "usage: uv run validate [<taskset-id>] [--runtime.type docker|prime] [options] [@ file.toml]\n"
     "       runs each task's `validate` hook (per-task validation, no model)"
 )
 
@@ -85,7 +85,6 @@ async def _validate_task(taskset: Taskset, task, config: ValidateConfig) -> dict
     valid, exc = False, None
     try:
         trace = Trace(task=task, state=state_cls(type(taskset))())
-        await runtime.start()
         await asyncio.wait_for(
             invoke(taskset.setup, {"task": task, "trace": trace, "runtime": runtime}),
             setup_timeout,
@@ -120,12 +119,6 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
         random.Random(0).shuffle(tasks)
     if config.num_tasks is not None:
         tasks = tasks[: config.num_tasks]
-    if isinstance(config.runtime, vf.SubprocessConfig) and (
-        taskset.NEEDS_CONTAINER or any(t.image for t in tasks)
-    ):
-        raise SystemExit(
-            "taskset needs a container runtime to validate - pass --runtime.type docker (or prime)"
-        )
     logger.info(
         "validating %d task(s) from %s on the %s runtime",
         len(tasks),

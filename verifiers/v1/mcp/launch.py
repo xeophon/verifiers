@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from verifiers.v1.errors import RolloutError, ToolsetError, UserError
+from verifiers.v1.errors import RolloutError, ToolsetError, UserError, boundary
 from verifiers.v1.mcp.server import STATE_SECRET_PARAM, STATE_URL_PARAM, ServerBase
 from verifiers.v1.runtimes import (
     HOST,
@@ -158,7 +158,7 @@ async def _install_in_sandbox(server: ServerBase, runtime: Runtime) -> str:
         f"{_ENSURE_UV}; set -e; "
         f'for t in {root}/*.tar.gz; do tar -xzf "$t" -C {root}; done && '
         f"uv venv {venv} && "
-        f"uv pip install --python {venv} {root}/{shlex.quote(vf.name)} && "
+        f"uv pip install --python {venv} 'mcp>=1.14.1,<2' {root}/{shlex.quote(vf.name)} && "
         f"uv pip install --python {venv} {root}/{shlex.quote(env.name)}"
     )
     result = await runtime.run(["sh", "-c", setup], {})
@@ -211,12 +211,11 @@ async def serve_in_runtime(
     """Start `server` inside `runtime` (background, by running its env module — `python -m <module>`,
     whose `__main__` calls `ServerBase.run()`), wait until it serves, and return the port it bound.
     An `exposed` server (reached from outside its runtime) binds the runtime's fixed `published_port`
-    (modal/prime forward only that); otherwise the server binds an OS-assigned free port in its own
+    (prime forwards only that); otherwise the server binds an OS-assigned free port in its own
     environment and reports it back (`MCP_PORT_FILE`) — so the launcher never probes for a free port.
     Only the `config` crosses as env JSON; the rollout's task is fetched by the server from the
-    interception `/task` channel (`state_url`), so it isn't passed here. On a host (`subprocess`)
-    runtime it runs with the eval's own interpreter; in a sandbox the working-tree `verifiers` source
-    + the env package are uploaded and installed first (`_install_in_sandbox`)."""
+    interception `/task` channel (`state_url`), so it isn't passed here. The working-tree `verifiers`
+    source + the env package are uploaded and installed first (`_install_in_sandbox`)."""
     env = {"VF_CONFIG": server.config.model_dump_json()}
     if (
         state_url
@@ -225,7 +224,7 @@ async def serve_in_runtime(
         env["VF_STATE_SECRET"] = state_secret
     if (
         runtime.published_port is not None
-    ):  # a self-publishing runtime (modal/prime) forwards to
+    ):  # a self-publishing runtime (prime) forwards to
         env["MCP_HOST"] = "0.0.0.0"  # all interfaces, not just loopback
     fixed = runtime.published_port if exposed else None
     port_file = None
@@ -234,15 +233,13 @@ async def serve_in_runtime(
     else:  # bind an OS-assigned free port in the server's own environment, reported back here
         port_file = f"/tmp/vf-port-{uuid.uuid4().hex}"
         env["MCP_PORT_FILE"] = port_file
-    if runtime.type == "subprocess":  # host: verifiers + env module already installed
-        python = sys.executable
-    else:  # sandbox: upload + install the verifiers source + the env package
-        python = await _install_in_sandbox(server, runtime)
+    python = await _install_in_sandbox(server, runtime)
     log = f"vf_tool_{server.server_name}.log"
     await runtime.run_background([python, "-m", type(server).__module__], env, log)
     if fixed is not None:
         port = fixed
     else:
+        assert port_file is not None
         try:
             port = await _read_back_port(runtime, port_file)
         except ToolsetError as e:
@@ -257,6 +254,14 @@ async def serve_in_runtime(
     return port
 
 
+def boundary_for_server(server: ServerBase):
+    """Attribute an in-process server setup failure to `UserError` or `ToolsetError`."""
+    from verifiers.v1.mcp.user import User
+
+    err_cls = UserError if isinstance(server, User) else ToolsetError
+    return boundary(err_cls, f"server {server.server_name!r}")
+
+
 @contextlib.asynccontextmanager
 async def serve(
     server: ServerBase,
@@ -264,6 +269,7 @@ async def serve(
     harness_runtime: Runtime | None = None,
     for_host: bool = False,
     harness_is_local: bool = True,
+    harness_on_host: bool = False,
     *,
     state_port: int | None = None,
     state_secret: str = "",
@@ -273,12 +279,9 @@ async def serve(
     up in its configured placement and yields one reachable URL, tearing down any runtime it
     owns. Placement comes from `server.config`:
       - `colocated` (with an `harness_runtime`): runs in the harness's own runtime, reusing it;
-      - otherwise: its OWN `runtime` (host by default), started and stopped here.
-    (A remote `url` toolset is short-circuited by the caller — it isn't launched.) Reachability
-    depends on who consumes it: `for_host` (a user sim the framework drives) yields a
-    host-reachable URL; otherwise (a tool the model calls) a harness-reachable one — localhost
-    in-sandbox when colocated, else the tool runtime's `expose` (its published URL) or, for a
-    host-side tool reached by an in-sandbox harness, a `host_endpoint` tunnel to the host port."""
+      - `runtime` set: runs in its OWN container/sandbox runtime, started and stopped here;
+      - default (`runtime=None`, `colocated=False`): runs in-process on the host event loop.
+    (A remote `url` toolset is short-circuited by the caller — it isn't launched.)"""
     cfg = server.config
     shared = getattr(cfg, "shared", False)
     if shared and task is not None:
@@ -295,29 +298,58 @@ async def serve(
             server.server_name,
         )
     async with contextlib.AsyncExitStack() as stack:
+        if not cfg.colocated and cfg.runtime is None:
+            # Default host placement: run in-process on loopback (no container or subprocess).
+            state_url = (
+                f"http://127.0.0.1:{state_port}/state"
+                if state_port is not None
+                else None
+            )
+            async with boundary_for_server(server):
+                port = await stack.enter_async_context(
+                    server.serve_in_process(
+                        task, state_url=state_url, state_secret=state_secret
+                    )
+                )
+            consumer = HOST if (for_host or harness_on_host) else harness_runtime
+            consumer_local = True if (for_host or harness_on_host) else harness_is_local
+            base = await stack.enter_async_context(
+                reachable_url(
+                    HOST, port, consumer=consumer, consumer_is_local=consumer_local
+                )
+            )
+            yield f"{base.rstrip('/')}/mcp"
+            return
+
         if cfg.colocated and harness_runtime is not None:
             runtime = harness_runtime
         else:
+            assert cfg.runtime is not None
             runtime = make_runtime(cfg.runtime)
-            await runtime.start()
             stack.push_async_callback(runtime.stop)
+            await runtime.start()
         # `exposed` = the port is reached from OUTSIDE the server's runtime — a `for_host` server (the
         # host reaches it) or a tool in its own runtime (the harness, elsewhere, reaches it) — so it
         # binds the runtime's fixed published_port. A colocated tool is reached in-sandbox at localhost
         # and binds an OS-assigned free port instead (two colocated servers can't then clash on the
         # published SERVICE_PORT). `serve_in_runtime` returns the actual bound port.
         exposed = for_host or runtime is not harness_runtime
-        # The shared-state channel: the interception server is a HOST service the server reaches from
-        # its own runtime — localhost when local, a tunnel when remote. Shared/eval-level servers get
-        # no channel (state is per-rollout; `state_port` is None for them).
         state_url = None
         if state_port is not None:
-            # A colocated server shares the harness's runtime, so the interception URL the harness
-            # already reaches (`state_base` — the pool's tunnel behind a remote runtime) is reachable
-            # from it too; reuse it instead of opening a second host tunnel to the same port (at high
-            # concurrency one per rollout swamps the tunnel service). A server in its own runtime
-            # can't assume that reach, so it bridges to the host port itself.
-            if state_base is not None and runtime is harness_runtime:
+            # Reuse `state_base` only when it is actually reachable from `runtime` (either `runtime`
+            # shares the host network, or `state_base` is already a public tunnel URL).
+            can_reuse_state_base = (
+                state_base is not None
+                and runtime is harness_runtime
+                and (
+                    runtime.is_local
+                    or not state_base.startswith(
+                        ("http://127.0.0.1:", "http://localhost:")
+                    )
+                )
+            )
+            if can_reuse_state_base:
+                assert state_base is not None
                 base = state_base
             else:
                 base = await stack.enter_async_context(
@@ -331,13 +363,19 @@ async def serve(
             state_url=state_url,
             state_secret=state_secret,
         )
-        # Who consumes the server decides reachability (see `reachable_url`): a user sim is reached
-        # by the host (`for_host`); a tool by the harness — its `harness_runtime` per rollout, or, for
-        # a shared eval-level tool with no single harness, just the harness locality (`harness_is_local`).
-        consumer = HOST if for_host else harness_runtime
+        consumer = (
+            HOST
+            if for_host
+            else (
+                HOST
+                if (harness_on_host and runtime is not harness_runtime)
+                else harness_runtime
+            )
+        )
+        consumer_local = True if (for_host or harness_on_host) else harness_is_local
         base = await stack.enter_async_context(
             reachable_url(
-                runtime, port, consumer=consumer, consumer_is_local=harness_is_local
+                runtime, port, consumer=consumer, consumer_is_local=consumer_local
             )
         )
         yield f"{base.rstrip('/')}/mcp"
@@ -392,6 +430,7 @@ async def serve_tools(
     task,
     shared_urls: dict[str, str] | None = None,
     *,
+    harness_on_host: bool = False,
     state_port: int | None = None,
     state_secret: str = "",
     state_base: str | None = None,
@@ -413,14 +452,19 @@ async def serve_tools(
                 logger.info("tool server '%s' (remote): %s", name, cfg.url)
             elif name in shared_urls:  # one shared instance, started eval-level
                 tool_state_base = state_base
+                tool_is_local = (
+                    True if cfg.runtime is None else runtime_is_local(cfg.runtime)
+                )
                 # `state_base` is the HARNESS-facing interception URL — host loopback when the harness
-                # is local, which a REMOTE shared tool can't reach. Bridge the interception's state
-                # port to a host tunnel the remote tool CAN reach (per-rollout, torn down with this
-                # scope). A remote harness already made `state_base` a public tunnel, so reuse it.
+                # runs on the host or on a local runtime, which a REMOTE shared tool can't reach.
+                # Bridge the interception's state port to a host tunnel the remote tool CAN reach.
                 if (
                     state_base
-                    and harness_runtime.is_local
-                    and not runtime_is_local(cfg.runtime)
+                    and state_port is not None
+                    and state_base.startswith(
+                        ("http://127.0.0.1:", "http://localhost:")
+                    )
+                    and not tool_is_local
                 ):
                     tool_state_base = await stack.enter_async_context(
                         reachable_url(HOST, state_port, consumer_is_local=False)
@@ -437,6 +481,8 @@ async def serve_tools(
                         toolset,
                         task,
                         harness_runtime,
+                        harness_is_local=harness_runtime.is_local,
+                        harness_on_host=harness_on_host,
                         state_port=state_port,
                         state_secret=state_secret,
                         state_base=state_base,

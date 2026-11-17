@@ -23,10 +23,9 @@ class ValidateConfig(BaseConfig):
 
     taskset: SerializeAsAny[TasksetConfig] = TasksetConfig()
     runtime: RuntimeConfig = DockerConfig()
-    """Where each task's `validate` hook runs. Docker by default — unlike the eval harness
-    (subprocess), a gold check often needs the task's declared container; a SWE task overrides
-    the image per task. Use `--runtime.type subprocess` for a check that needs no container —
-    one that only reads task data or runs a uv-script verifier (e.g. gsm8k)."""
+    """Where each task's `validate` hook runs (`docker` / `prime`). Docker by
+    default, provisioned lazily on first use — pure-Python checks (e.g. gsm8k) spawn no
+    container or sandbox, while containerized tasks (e.g. SWE rows) override `image` per task."""
     setup_timeout: float | None = None
     """Max wall-clock for the taskset's `setup` hook per task (None = no limit)."""
     validate_timeout: float | None = None

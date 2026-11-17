@@ -2,8 +2,8 @@
 
 Every task is one greedy rollout (`temperature=0`, set in `run_v1`) on a single task with
 turn/timeout caps. The matrix axes are the runtimes a rollout places things in: the **harness**
-runtime (`harness_runtime`), the **user** simulator's runtime (`user_runtime`), and the **tool**
-server's runtime (`tool_runtime`) — each spanning subprocess/docker/prime/modal. Every matrix value
+runtime (`harness_runtime`), the **user** simulator's placement (`user_runtime`), and the **tool**
+server's placement (`tool_runtime`) — spanning in-process host + docker/prime. Every matrix value
 carries a pytest mark, so subsets select with `-m` (see `conftest.py`).
 
 `test_user` and `test_tool` fan a server's own runtime against the harness runtime (the full
@@ -42,7 +42,7 @@ async def test_user(run_v1, harness_runtime, user_runtime, tmp_path):
     # A user sim in a prime sandbox — its own, or colocated in a prime harness — must be reached by
     # the host framework via prime port exposure, whose URL isn't reachable from the host here
     # (region=us doesn't help). Skip until it is.
-    user_rt = user_runtime.get("runtime", {}).get("type")
+    user_rt = (user_runtime.get("runtime") or {}).get("type")
     if user_rt == "prime" or (
         user_runtime.get("colocated") and harness_runtime == "prime"
     ):
@@ -76,7 +76,7 @@ async def test_tool(run_v1, run_v1_server, harness_runtime, tool_runtime, tmp_pa
     in-process."""
     # Reaching a tool server in its own prime sandbox needs prime port exposure, whose URL isn't
     # reachable from the host here (region=us doesn't help). Skip until it is.
-    if tool_runtime.get("runtime", {}).get("type") == "prime":
+    if (tool_runtime.get("runtime") or {}).get("type") == "prime":
         pytest.skip(
             "tool server in a prime sandbox needs prime port exposure (unreachable from host here)"
         )
@@ -108,7 +108,7 @@ async def test_tool_state(run_v1, harness_runtime, tool_runtime, tmp_path):
         )
     # Reaching a tool server in its own prime sandbox needs prime port exposure, whose URL isn't
     # reachable from the host here (region=us doesn't help). Skip until it is.
-    if tool_runtime.get("runtime", {}).get("type") == "prime":
+    if (tool_runtime.get("runtime") or {}).get("type") == "prime":
         pytest.skip(
             "tool server in a prime sandbox needs prime port exposure (unreachable from host here)"
         )
@@ -141,10 +141,11 @@ async def test_shared_tool_isolation(
     colocated/shared params have no distinct runtime to fan — skipped). Runs through the env-server
     pool (`run_v1_server`, prime-rl's path), where serving the one shared instance is the server's
     job."""
-    # colocated / shared placement has no distinct own runtime to fan here
-    tool_rt = tool_runtime.get("runtime", {}).get("type")
-    if tool_rt is None:
+    # colocated / shared placement has no distinct own server target to fan here ("runtime" key is
+    # present for both `host` (`{"runtime": None}`) and isolated runtimes (`{"runtime": {"type": ...}}`)).
+    if "runtime" not in tool_runtime:
         pytest.skip("shared-isolation fans the tool's own runtime; this case has none")
+    tool_rt = (tool_runtime.get("runtime") or {}).get("type")
     # Reaching a tool server in its own prime sandbox needs prime port exposure, whose URL isn't
     # reachable from the host here (region=us doesn't help). Skip until it is.
     if tool_rt == "prime":
@@ -180,7 +181,6 @@ async def test_tool_response_image(run_v1, tmp_path):
     (trace,) = await run_v1(
         "tool-response-image-v1",
         harness="null",
-        harness_overrides={"runtime": {"type": "subprocess"}},
         model="qwen/qwen3-vl-8b-instruct",
         output_dir=tmp_path,
         max_turns=4,

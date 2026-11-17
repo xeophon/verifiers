@@ -131,16 +131,16 @@ class Rollout:
         else:
             async with InterceptionServer() as server:
                 secret = server.register(session)
-                # a HOST service the harness (in `runtime`) reaches: localhost or a tunnel
-                async with reachable_url(HOST, server.port, consumer=runtime) as url:
+                consumer = HOST if self.harness.RUNS_ON_HOST else runtime
+                # a HOST service the harness reaches: localhost (host/docker) or a tunnel
+                async with reachable_url(HOST, server.port, consumer=consumer) as url:
                     yield f"{url}/v1", secret, server.port, url
 
     async def run(self) -> Trace:
         """Run the rollout and return its trace. Captures expected `RolloutError`s onto
-        the trace (a bad rollout is data, not a crash), runs per-rollout scoring while
-        the runtime is live, then tears the runtime down in a `finally`. Reuses the
-        eval-level shared tool servers / interception pool injected at construction (see
-        `self.shared_urls` / `self.interception`)."""
+        the trace (a bad rollout is data, not a crash), runs per-rollout scoring, then tears
+        down any provisioned runtime in a `finally`. The runtime provisions lazily on first
+        use, so rollouts that never touch it spawn no container or sandbox."""
         trace: Trace = Trace(task=self.task, state=state_cls(type(self.taskset))())
         self.trace = trace  # expose for the --rich dashboard
         self.phase = Phase.SETUP  # leaving the queue: provisioning starts now
@@ -160,7 +160,6 @@ class Rollout:
         )
         try:
             session = RolloutSession(ctx, trace, stops, self.limits)
-            await runtime.start()
             setup_deadline = (
                 None
                 if self.setup_timeout is None
@@ -195,6 +194,7 @@ class Rollout:
                         runtime,
                         self.task,
                         shared_urls=self.shared_urls,
+                        harness_on_host=self.harness.RUNS_ON_HOST,
                         state_port=state_port,
                         state_secret=secret,
                         state_base=state_base,

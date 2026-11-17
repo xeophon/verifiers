@@ -28,8 +28,8 @@ class PrimeConfig(BaseConfig):
     image: str = "python:3.11-slim"
     workdir: str = "/app"
     network_access: bool = True
-    vm: bool = False
-    """Run as a micro-VM rather than a container (kernel features / stronger isolation)."""
+    vm: bool = True
+    """Run as a micro-VM (Prime retired non-VM container sandboxes)."""
     guaranteed: bool = False
     """Request guaranteed (vs best-effort) capacity."""
     region: str | None = None
@@ -37,7 +37,7 @@ class PrimeConfig(BaseConfig):
     labels: list[str] = []
     """Labels attached to the sandbox and its tunnels — e.g. to group every resource a run
     creates. When unset, the eval defaults them to the run's uuid (see `run_eval`)."""
-    # TaskResources, in Modal's units (also settable per-task via Task.resources, with
+    # TaskResources (also settable per-task via Task.resources, with
     # precedence cli/toml > task > this default). Mapped to prime's API in `start`.
     cpu: float = 1.0
     """CPU cores."""
@@ -72,7 +72,7 @@ class PrimeRuntime(Runtime):
     def published_port(self) -> int | None:
         return SERVICE_PORT
 
-    async def start(self) -> None:
+    async def _start(self) -> None:
         from prime_sandboxes import AsyncSandboxClient, CreateSandboxRequest
 
         self._client = AsyncSandboxClient()
@@ -119,7 +119,8 @@ class PrimeRuntime(Runtime):
         ) as e:  # provisioning failure is one rollout's problem, not the eval's
             raise SandboxError(f"prime sandbox provisioning failed: {e}") from e
 
-    async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+    async def _run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        assert self._client is not None and self._sandbox_id is not None
         try:
             # Poll directly so the rollout stage owns the execution timeout; the SDK helper
             # otherwise imposes its own 15-minute limit.
@@ -146,38 +147,40 @@ class PrimeRuntime(Runtime):
             stderr=result.stderr or "",
         )
 
-    async def expose(self, port: int) -> str | None:
+    async def _expose(self, port: int) -> str | None:
         # Publish a server hosted IN the sandbox via the SDK's native port exposure → a public
         # HTTPS URL. Removed when the sandbox is deleted in stop(), so a tool in its own prime
         # sandbox needs no host tunnel. Port exposure is region-gated: many regions (incl. the
         # backend default, which lands in us-central) 400 it; `us` supports it. TODO: re-enable the
         # prime cases in the e2e `skip_if_unexposable` guard once prime exposes ports in any region.
+        assert self._client is not None and self._sandbox_id is not None
         try:
             exposed = await self._client.expose(self._sandbox_id, port)
         except Exception as e:  # surface prime's exposure constraints actionably
             raise SandboxError(
                 "prime port exposure failed — port exposure isn't supported in this sandbox's "
                 "region; pin `tools.runtime.region` to a region that supports it (e.g. `us`), or "
-                f"use a colocated / docker / modal tools.runtime instead. ({e})"
+                f"use a colocated or docker tools.runtime instead. ({e})"
             ) from e
         logger.info("prime: exposed sandbox port %d at %s", port, exposed.url)
         return exposed.url.rstrip("/")
 
-    async def run_background(
+    async def _run_background(
         self, argv: list[str], env: dict[str, str], log: str
     ) -> None:
         # `&` backgrounds inside the sandbox; the job returns immediately, the process
         # lives until the sandbox is deleted in stop().
         inner = f"nohup {shlex.join(argv)} > {shlex.quote(log)} 2>&1 &"
-        result = await self.run(["sh", "-c", inner], env)
+        result = await self._run(["sh", "-c", inner], env)
         if result.exit_code != 0:
             raise SandboxError(
                 f"prime background launch failed: {result.stderr.strip()}"
             )
 
-    async def read(self, path: str) -> bytes:
+    async def _read(self, path: str) -> bytes:
         # Avoid background-job log limits and base64 overhead by downloading binary data directly.
         # The temporary file is removed on every exit, and its byte read stays off the event loop.
+        assert self._client is not None and self._sandbox_id is not None
         target = (
             path
             if path.startswith("/")
@@ -193,18 +196,19 @@ class PrimeRuntime(Runtime):
         except Exception as e:
             raise SandboxError(f"read {path!r}: {e}") from e
 
-    async def write(self, path: str, data: bytes) -> None:
+    async def _write(self, path: str, data: bytes) -> None:
         # Upload via the gateway (multipart) — never inline the bytes on the command line
         # (a large file, e.g. a task tarball, overflows the exec command-length limit and
         # fails with ENAMETOOLONG). The upload does NOT run in the workdir, so resolve a
         # relative path against it (and mkdir its parent) — otherwise the sidecar writes
         # it somewhere unwritable ("Operation not permitted").
+        assert self._client is not None and self._sandbox_id is not None
         target = (
             path
             if path.startswith("/")
             else f"{self.config.workdir.rstrip('/')}/{path}"
         )
-        await self.run(
+        await self._run(
             ["sh", "-c", f"mkdir -p {shlex.quote(str(PurePosixPath(target).parent))}"],
             {},
         )

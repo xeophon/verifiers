@@ -65,7 +65,6 @@ from verifiers.v1.runtimes import (
     ProgramResult,
     Runtime,
     RuntimeConfig,
-    SubprocessConfig,
 )
 from verifiers.v1.state import State, StateT
 from verifiers.v1.task import Task, TaskResources, TaskTimeout, WireTask
@@ -175,7 +174,6 @@ __all__ = [
     "Runtime",
     "RuntimeConfig",
     "ProgramResult",
-    "SubprocessConfig",
     "DockerConfig",
     "PrimeConfig",
     "Environment",

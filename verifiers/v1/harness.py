@@ -21,10 +21,10 @@ from verifiers.v1.decorators import discover_decorated, invoke
 from verifiers.v1.errors import HarnessError, boundary
 from verifiers.v1.utils.install import env_name
 from verifiers.v1.runtimes import (
+    DockerConfig,
     ProgramResult,
     Runtime,
     RuntimeConfig,
-    SubprocessConfig,
 )
 from verifiers.v1.task import Task
 from verifiers.v1.trace import Trace
@@ -43,11 +43,11 @@ class HarnessConfig(BaseConfig):
     """The harness id, which selects this harness: a local package, or an
     `org/name[@version]` package installed on demand from the Environments Hub (see
     `EnvId`). Set via `--harness.id`."""
-    runtime: RuntimeConfig = SubprocessConfig()
-    """Where the harness runs (subprocess / docker / prime). Subprocess by default — a local
-    process on the host; a taskset that needs a container (its own image, or NEEDS_CONTAINER)
-    selects `--harness.runtime.type docker` (or prime/modal). Lives on the harness — it's the
-    harness's box; tool servers have their own placement (see `TasksetConfig.tools`)."""
+    runtime: RuntimeConfig = DockerConfig()
+    """Where sandboxed execution runs (`docker` / `prime`). Docker by default; the
+    runtime provisions lazily on first use, so pure-chat rollouts (`null` harness, or `default`
+    when the model makes no `bash`/`edit` calls) spawn no container or sandbox at all. Tool
+    servers have their own placement (see `TasksetConfig.tools`)."""
     env: dict[str, str] = Field(default_factory=dict)
     """Additional environment variables for the harness program. Harness-owned endpoint,
     authentication, and model variables take precedence."""
@@ -88,6 +88,10 @@ class Harness(ABC, Generic[ConfigT]):
     """Drive a task's user simulator (multi-turn user injection); opt in per harness."""
     SUPPORTS_MESSAGE_PROMPT: ClassVar[bool] = False
     """Accept a Messages-list task.prompt (e.g. an image-bearing prompt); opt in per harness."""
+    RUNS_ON_HOST: ClassVar[bool] = False
+    """True when the harness drives its model + MCP client loop in-process on the host (delegating
+    any sandboxed tool execution to `runtime`), so it reaches the interception server and host MCP
+    servers over loopback without opening a reverse tunnel."""
 
     def __init__(self, config: ConfigT) -> None:
         self.config = config

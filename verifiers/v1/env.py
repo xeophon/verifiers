@@ -28,7 +28,6 @@ from verifiers.v1.retries import RetryConfig
 from verifiers.v1.rollout import Rollout
 from verifiers.v1.runtimes import (
     RuntimeConfig,
-    SubprocessConfig,
     runtime_is_local,
 )
 from verifiers.v1.task import Task
@@ -188,19 +187,13 @@ logger = logging.getLogger(__name__)
 def resolve_runtime_config(
     base: RuntimeConfig, task: Task, warned: set[tuple[str, str]] | None = None
 ) -> RuntimeConfig:
-    """Resolve a task's runtime config from a `base`: inject the task's `image` (a task with
-    an image must run in a container — refuse subprocess), and apply its `workdir` and
-    requested `resources` to the fields the runtime supports. Precedence is cli/toml > task >
-    default; a resource the runtime doesn't support warns once (deduped via `warned`). Shared
-    by `Environment.runtime_for` (rollouts) and the `validate` entrypoint."""
+    """Resolve a task's runtime config from a `base`: inject the task's `image`, and apply its
+    `workdir` and requested `resources` to the fields the runtime supports. Precedence is
+    cli/toml > task > default; a resource the runtime doesn't support warns once (deduped via
+    `warned`). Shared by `Environment.runtime_for` (rollouts) and the `validate` entrypoint."""
     config = base
     updates: dict = {}
     if task.image is not None:
-        if isinstance(config, SubprocessConfig):
-            raise ValueError(
-                f"task {task.idx!r} requires image {task.image!r}, but the subprocess "
-                "runtime has no container; use the docker or prime runtime"
-            )
         updates["image"] = task.image
     workdir_spec = type(config).model_fields.get("workdir")
     if (
@@ -253,28 +246,6 @@ class Environment:
                 f"Harness {self.harness.config.id!r} does not drive a user simulator, but taskset "
                 f"{self.taskset.config.id!r} defines one (Taskset.user). Run it with a harness that "
                 f"supports user simulation (e.g. --harness.id default), or use a taskset without one."
-            )
-        if self.taskset.NEEDS_CONTAINER and isinstance(
-            self.harness.config.runtime, SubprocessConfig
-        ):
-            raise ValueError(
-                f"Taskset {self.taskset.config.id!r} needs a container runtime "
-                "(NEEDS_CONTAINER), but the harness runs on the subprocess runtime; "
-                "use --harness.runtime.type docker or prime."
-            )
-        # The warning is about the *agent* running arbitrary code on the host: every harness hands
-        # it local execution (bash/edit, or a CLI agent) except the tool-less `null` chat loop,
-        # whose program only relays the model and remote MCP tools — so exempt `null`, warn for the
-        # rest. (`null` still runs its fixed chat-loop program locally, but nothing agent-authored.)
-        if self.harness.config.id != "null" and isinstance(
-            self.harness.config.runtime, SubprocessConfig
-        ):
-            logger.warning(
-                "Harness %r is running in the subprocess runtime on the local system. "
-                "Local files and settings may affect the evaluation; use subprocess only "
-                "for debugging. Use --harness.runtime.type docker or prime for an isolated "
-                "run.",
-                self.harness.config.id,
             )
         self.setup_timeout = config.timeout.setup
         self.harness_timeout = config.timeout.rollout
@@ -386,24 +357,27 @@ class Environment:
 
     def interception_pool(self) -> InterceptionPool:
         """The shared interception pool for this env's rollouts — one server (+ tunnel
-        behind a remote runtime) per `multiplex` rollouts, grown on demand. Built here,
-        where the harness runtime and `multiplex` live; the caller (eval runner / env
-        server) enters it for the run and tears it down. Pass it to `Episode.run`."""
-        return InterceptionPool(self.harness.config.runtime, self.config.multiplex)
+        behind a remote in-runtime harness) per `multiplex` rollouts, grown on demand.
+        Built here, where the harness runtime and `multiplex` live; the caller (eval runner /
+        env server) enters it for the run and tears it down. Pass it to `Episode.run`."""
+        is_local = self.harness.RUNS_ON_HOST or runtime_is_local(
+            self.harness.config.runtime
+        )
+        return InterceptionPool(
+            self.harness.config.runtime, self.config.multiplex, is_local=is_local
+        )
 
     @contextlib.asynccontextmanager
     async def shared_tools(self, tasks: list[Task]):
-        """Start any tool servers whose placement is `shared` ONCE for the eval (each in its
-        own `runtime`) and yield `{name: url}` to inject into every rollout — so an expensive
-        corpus is built once, not per rollout. No-op ({}) when none are shared. A shared server
-        must be task-agnostic: its `setup` gets no task (so it can't silently serve one task's
-        data to every rollout); `tools(tasks[0])` here only builds the toolset instances. A shared
-        server on a host runtime is bridged to the host once (a tunnel) when the harness runs
-        remotely, so an in-sandbox harness can still reach it (see `serve_shared`)."""
+        """Start any tool servers whose placement is `shared` ONCE for the eval and yield
+        `{name: url}` to inject into every rollout — so an expensive corpus is built once, not
+        per rollout. No-op ({}) when none are shared."""
         servers = self.taskset.tools(tasks[0]) if tasks else []
         if not any(server.config.shared for server in servers):
             yield {}
             return
-        harness_is_local = runtime_is_local(self.harness.config.runtime)
+        harness_is_local = self.harness.RUNS_ON_HOST or runtime_is_local(
+            self.harness.config.runtime
+        )
         async with serve_shared(servers, harness_is_local=harness_is_local) as urls:
             yield urls

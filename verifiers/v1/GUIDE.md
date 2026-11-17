@@ -15,10 +15,10 @@ config. You'll likely work with them in different proportions:
   (*how* the model is called). **Usually you just pick a built-in** (`default` / `rlm` /
   `codex`); you only write your own if you need a custom rollout loop. With some exceptions, any
   taskset runs under any harness.
-- **Runtime** — *where* the harness (and the taskset's tools / user simulator) executes:
-  `subprocess` / `docker` / `prime` / `modal`. **You never write one** — runtimes ship with the
-  framework behind one `Runtime` contract and compose with any taskset/harness; you just choose
-  where code runs.
+- **Runtime** — *where* sandboxed execution runs: `docker` / `prime` (provisioned
+  lazily on first use). **You never write one** — runtimes ship with the framework behind one
+  `Runtime` contract and compose with any taskset/harness; you just choose where isolated code
+  runs.
 
 The output of a rollout is a `Trace` — the full record of the agent's trajectory: every
 message plus all the metadata captured along the way (token ids, logprobs, tool calls,
@@ -29,7 +29,7 @@ trains on.
 
 ```bash
 uv sync                          # core + shipped packages + examples
-uv run eval gsm8k-v1 -n 5 -r 3   # 5 tasks, 3 rollouts each; default harness, subprocess runtime
+uv run eval gsm8k-v1 -n 5 -r 3 --harness.id null  # 5 tasks, 3 rollouts each; no sandbox spawned
 uv run eval -h                   # typed help (lists local tasksets + harnesses)
 ```
 
@@ -80,11 +80,6 @@ these off the generic bases to type `self.config`, `trace.task`, and `trace.stat
 The taskset module must export its `Taskset` subclass via `__all__` — the loader walks the
 exported names and finds the single `Taskset` subclass.
 
-**Capability flag.** A taskset has one class var, `NEEDS_CONTAINER` (default `False`); set it `True`
-to declare the taskset only runs in a container runtime (`docker` / `prime`), so the framework
-refuses the subprocess runtime up front — the taskset-wide counterpart to a task's per-row `image`
-(see [Runtimes](#runtimes)).
-
 ## The task
 
 `vf.Task` is a frozen pydantic model. Subclass it to add typed, task-specific fields (the
@@ -98,7 +93,7 @@ reference answer, ground truths, per-row metadata) that flow — fully typed —
 | `description` | `str \| None` | human-readable description |
 | `prompt` | `str \| Messages \| None` *(required)* | the opening user message. A `str` is the usual case; a `Messages` list seeds a full initial conversation (e.g. a user message carrying images — only harnesses with `SUPPORTS_MESSAGE_PROMPT`); **`None` means the task carries no prompt** and the user simulator opens the conversation (see [User simulators](#user-simulators)) |
 | `system_prompt` | `str \| None` | system prompt; emitted as a real system message by harnesses that set `APPENDS_SYSTEM_PROMPT`, else folded into `prompt` |
-| `image` | `str \| None` | container image the task needs — forces a container runtime (the subprocess runtime is refused) |
+| `image` | `str \| None` | container image the task needs (injected into `docker` / `prime`) |
 | `workdir` | `str \| None` | working directory the harness and scoring run in |
 | `timeout` | `TaskTimeout` | per-task, per-stage wall-clock overrides |
 | `resources` | `TaskResources` | per-task runtime resource requests |
@@ -352,15 +347,13 @@ isolated environment. On a `runtime` you can call:
 
 A non-zero `exit_code` is a normal result, not an exception — check it and `raise` (a plain
 Python error) yourself if it should fail the stage; the framework records a failure in your
-taskset code as a `TasksetError`. The same code works on subprocess / docker / prime / modal.
+taskset code as a `TasksetError`. The same code works on docker and prime.
 
 A SWE taskset is the canonical case: `setup` provisions the repo, the agent edits it during the
 rollout, and a `@reward` runs the tests in the *same* runtime:
 
 ```python
 class SWETaskset(vf.Taskset[SWETask, SWEConfig]):
-    NEEDS_CONTAINER = True   # the only Taskset class var: refuse the subprocess runtime
-
     async def setup(self, task, runtime) -> None:
         await runtime.run(["git", "clone", task.repo_url, "/repo"], {})
         await runtime.run(["git", "-C", "/repo", "checkout", task.base_commit], {})
@@ -508,7 +501,7 @@ the default is the cheapest correct thing; the rest trade setup cost for isolati
 
 | mode | config | runs | pros | cons |
 | --- | --- | --- | --- | --- |
-| **own runtime** *(default)* | *(nothing; `runtime = {type = "docker"\|"prime"}` for a sandbox)* | own runtime per rollout — `subprocess` on the host (default), or a `docker`/`prime` sandbox over a tunnel | full per-rollout isolation; a sandbox also isolates untrusted code / deps / network | pays `setup` every rollout (a sandbox adds spin-up + env install) |
+| **host / own runtime** *(default)* | *(nothing; `runtime = {type = "docker"\|"prime"}` for a sandbox)* | in-process on the host per rollout (`runtime = None`, default), or an isolated `docker`/`prime` sandbox | zero container/subprocess overhead on the host; setting `runtime` isolates untrusted code / deps / network | pays `setup` every rollout (a sandbox adds spin-up + env install) |
 | **colocated** | `colocated = true` | inside the harness's runtime, one per rollout (no tunnel) | no extra runtime/tunnel; can touch the harness's filesystem | couples to the harness; `setup` per rollout |
 | **shared** | `shared = true` | one instance for the whole eval | `setup` once; writable per-rollout if state lives in `self.state` | state outside `self.state` corrupts across rollouts; `setup_task` skipped |
 | **remote** *(tools only)* | `url = "https://…"` | connects to an already-running MCP endpoint | zero hosting; use a public/third-party server | no isolation, state, or lifecycle control |
@@ -661,19 +654,15 @@ runtime (e.g. read a `meta.json` the binary wrote). A harness can't define rewar
 
 # Runtimes
 
-The same `Runtime` contract backs the harness (`--harness.runtime`), a task's tools
-(`--taskset.tools.runtime`), and the user simulator. You choose where code runs; you never write
-one:
+The same `Runtime` contract backs sandboxed execution for the harness (`--harness.runtime`),
+isolated tool servers (`--taskset.tools.runtime`), and isolated user simulators. Runtimes
+provision lazily on first use — pure-chat, judge-scored, user-simulated, and host-MCP rollouts
+spawn no container or sandbox at all:
 
 ```bash
-uv run eval gsm8k-v1 -n 1 --harness.runtime.type subprocess  # local process (eval default)
-uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container (default)
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type prime       # remote prime sandbox (requires auth)
-uv run eval gsm8k-v1 -n 1 --harness.runtime.type modal       # remote modal sandbox (requires auth)
 ```
-
-A taskset that sets `NEEDS_CONTAINER` (or a task with an `image`) refuses the subprocess runtime —
-pass `docker` / `prime` / `modal`.
 
 ---
 
@@ -713,7 +702,7 @@ uv run eval gsm8k-v1 -n 5 -r 3 \
 | timeouts | `--timeout.setup`, `--timeout.rollout`, `--timeout.finalize`, `--timeout.scoring` (None = no limit) |
 | retries | `--retries.rollout.max-retries` (0), `--retries.rollout.include`/`.exclude` (by exception name); per-call model/runtime retries are owned by the harness/runtime SDKs |
 | client | `--client.type` (`eval`\|`train`), `--client.base-url`, `--client.api-key-var` |
-| runtime | `--harness.runtime.type` (`subprocess`), `--harness.env`, `--harness.disabled-tools` |
+| runtime | `--harness.runtime.type` (`docker`), `--harness.env`, `--harness.disabled-tools` |
 | concurrency | `-c`/`--max-concurrent` (128), `--multiplex` (32), `--pool.type` (`elastic`\|`static`) |
 | output | `-o`/`--output-dir`, `--dry-run`, `--no-rich`, `-v`/`--verbose` |
 
@@ -740,22 +729,22 @@ makes the tests pass, the verifier accepts the gold answer) — in a runtime wit
 `setup` applied. No model, no harness.
 
 ```bash
-uv run validate gsm8k-v1 -n 20 --runtime.type subprocess
+uv run validate gsm8k-v1 -n 20
 ```
 
 | flag | default | meaning |
 | --- | --- | --- |
 | `<taskset-id>` / `--taskset.id` | — | taskset to validate |
-| `--runtime.type` | `docker` | runtime for `setup` + `validate` (a gold check often needs the task's container) |
+| `--runtime.type` | `docker` | runtime for `setup` + `validate`, provisioned lazily on first use |
 | `--setup-timeout` / `--validate-timeout` | None | per-hook wall-clock caps |
 | `-n`/`--num-tasks`, `-s`/`--shuffle`, `-c`/`--max-concurrent` (128) | | task selection + concurrency |
 | `-v`/`--verbose`, `--no-rich` | | logging / disable the dashboard |
 
-Each task is provisioned, set up, validated, and torn down independently; a raised error is
-captured as a result row (one bad task is data, not a crash) with reason `valid` / `invalid` /
-`timeout` / `error`. **Fire-and-forget — nothing is written to disk**; results show live. Note the
-default runtime is **docker** (unlike eval's subprocess), and a subprocess runtime against a
-`NEEDS_CONTAINER` / image-bearing taskset aborts with a clear error.
+Each task is set up, validated, and torn down independently; a pure-Python check (like `gsm8k-v1`)
+never touches the runtime and spawns no container, while a containerized gold check boots the
+task's declared image on demand. A raised error is captured as a result row (one bad task is data,
+not a crash) with reason `valid` / `invalid` / `timeout` / `error`. **Fire-and-forget — nothing is
+written to disk**; results show live.
 
 ## `init`
 
@@ -790,8 +779,8 @@ form. In a prime-rl config:
 ```toml
 [[orchestrator.train.env]]
 name    = "gsm8k"
-taskset = { id = "gsm8k-v1", dataset_name = "..." }                 # any v1 taskset id
-harness = { id = "null", runtime = { type = "subprocess" } }
+taskset = { id = "gsm8k-v1" }                                       # any v1 taskset id
+harness = { id = "null" }                                           # pure chat loop — no sandbox spawned
 timeout = { scoring = 10 }                                          # per-stage cap (default: no limit)
 # pool  = { type = "elastic", max_workers = 8, multiplex = 128 }    # env-server pool (default elastic, self-sizing)
 ```

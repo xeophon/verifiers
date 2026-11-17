@@ -34,12 +34,19 @@ class InterceptionPool:
     server (one tunnel behind a remote runtime); `acquire` hands a rollout a slot on one,
     bringing up a new server when all are at capacity."""
 
-    def __init__(self, runtime_config: RuntimeConfig, multiplex: int) -> None:
-        # The harness runtime's topology decides reachability: a remote one needs a host tunnel
-        # to the interception port, a local one is reached at localhost. Read off the runtime
-        # class (no provisioning) — the pool never runs a sandbox.
+    def __init__(
+        self,
+        runtime_config: RuntimeConfig,
+        multiplex: int,
+        *,
+        is_local: bool | None = None,
+    ) -> None:
+        # Reachability to the interception server: localhost when the harness runs on the host or
+        # on a host-networked runtime (`docker`), else a reverse tunnel (`prime`).
         self.runtime_type = runtime_config.type
-        self.is_local = runtime_is_local(runtime_config)
+        self.is_local = (
+            runtime_is_local(runtime_config) if is_local is None else is_local
+        )
         self.multiplex = max(1, multiplex)
         self._servers: list[PooledServer] = []
         self._lock = asyncio.Lock()

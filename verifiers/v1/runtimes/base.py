@@ -49,7 +49,7 @@ _ENSURE_UV = (
     "|| pip install -q -U uv 2>/dev/null"
 )
 
-# The single port a self-publishing runtime (modal/prime) forwards to a public URL for a server
+# The single port a self-publishing runtime (prime) forwards to a public URL for a server
 # hosted in its sandbox. A server placed in such a runtime binds this (on 0.0.0.0) and is reached
 # at the runtime's public URL.
 SERVICE_PORT = 8000
@@ -63,7 +63,7 @@ class ProgramResult:
 
 
 def parse_gpu(gpu: str | None) -> tuple[str | None, int]:
-    """A Modal-style GPU spec -> (type, count) for providers that want them split:
+    """Parse a GPU spec into `(type, count)` for providers that want them split:
     "A100" -> ("A100", 1), "A100:2" -> ("A100", 2), "2" -> (None, 2) (count only,
     provider-chosen type), None/"" -> (None, 0)."""
     if not gpu:
@@ -107,41 +107,62 @@ class Runtime(ABC):
     is_local: ClassVar[bool] = True
     """Whether this runtime shares the host network — a program inside it reaches a host service
     at localhost (no tunnel) and a service inside it is reachable at localhost. True for
-    subprocess / docker(--network host); remote runtimes (modal/prime) override to False (they
-    need a tunnel each way: `host_endpoint` inward, `expose` outward)."""
+    docker(--network host); remote runtimes (prime) override to False (they need a tunnel
+    each way: `host_endpoint` inward, `expose` outward)."""
 
     def __init__(self, name: str | None = None) -> None:
         self.name = name or f"vf-{uuid.uuid4().hex[:12]}"
-        """Resource name — the subprocess workdir, docker `--name`, prime sandbox name.
+        """Resource name — the docker `--name` or prime sandbox name.
         The rollout passes its trace id, so the provisioned resource is greppable back to
         the rollout it serves; falls back to a unique `vf-` name (standalone / tool
         runtimes, where there's no single owning rollout)."""
         self._uv_interpreters: dict[str, str] = {}
         self._uv_script_locks: dict[str, asyncio.Lock] = {}
+        self._provisioning = False
+        self._started = False
+        self._start_lock = asyncio.Lock()
 
     # --- identity / display ---
 
     @property
     def type(self) -> str:
-        """The runtime's config discriminator ("subprocess" / "docker" / "prime" / "modal")."""
+        """The runtime's config discriminator ("docker" / "prime")."""
         return self.config.type
+
+    @property
+    def started(self) -> bool:
+        """Whether this runtime has provisioned its underlying container/sandbox."""
+        return self._started
 
     @property
     def descriptor(self) -> str | None:
         """A short resolved id for display (None until provisioned). Overridden per
-        runtime: subprocess workdir, docker image, prime sandbox id."""
+        runtime: docker container id, prime sandbox id."""
         return None
 
     # --- lifecycle ---
 
-    @abstractmethod
     async def start(self) -> None:
-        """Provision execution (workspace / container / sandbox). Use `expose` to turn a
-        host port into a URL the program can reach."""
+        """Provision execution idempotently on first use (container / sandbox)."""
+        if self._started:
+            return
+        async with self._start_lock:
+            if self._started:
+                return
+            self._provisioning = True
+            register(self)
+            await self._start()
+            self._started = True
+
+    @abstractmethod
+    async def _start(self) -> None:
+        """Provision the underlying container or sandbox."""
 
     async def stop(self) -> None:
         """Free the provisioned resource on the normal path, off the event loop. Override
         only for teardown that must be async (e.g. a remote API call)."""
+        if not self._provisioning:
+            return
         await asyncio.to_thread(self.cleanup)
 
     def cleanup(self) -> None:
@@ -151,9 +172,15 @@ class Runtime(ABC):
 
     # --- execution ---
 
-    @abstractmethod
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
-        """Run `argv` (with the interception env vars `env`) to completion."""
+        """Run `argv` (with the interception env vars `env`) to completion, starting the
+        runtime on first use."""
+        await self.start()
+        return await self._run(argv, env)
+
+    @abstractmethod
+    async def _run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        """Run `argv` in the already-started runtime."""
 
     async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         """Run the harness's MAIN program — the rollout itself (a possibly long-lived, stateful,
@@ -169,6 +196,12 @@ class Runtime(ABC):
         """Start `argv` as a background process in the runtime (combined output to
         `log`, a path in the workspace) and return immediately. It runs until `stop()`
         tears the runtime down. Used to host a tool server colocated with the harness."""
+        await self.start()
+        await self._run_background(argv, env, log)
+
+    async def _run_background(
+        self, argv: list[str], env: dict[str, str], log: str
+    ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} does not support run_background"
         )
@@ -249,32 +282,45 @@ class Runtime(ABC):
 
     # --- filesystem ---
 
-    @abstractmethod
     async def read(self, path: str) -> bytes:
-        """Read a file from the runtime's workspace. The caller need not know
-        whether that's the host fs or across a container/sandbox boundary."""
+        """Read a file from the runtime's workspace, starting the runtime on first use."""
+        await self.start()
+        return await self._read(path)
 
     @abstractmethod
+    async def _read(self, path: str) -> bytes:
+        """Read a file from the already-started runtime's workspace."""
+
     async def write(self, path: str, data: bytes) -> None:
-        """Write a file into the runtime's workspace, creating parent dirs."""
+        """Write a file into the runtime's workspace, creating parent dirs and starting the
+        runtime on first use."""
+        await self.start()
+        await self._write(path, data)
+
+    @abstractmethod
+    async def _write(self, path: str, data: bytes) -> None:
+        """Write a file into the already-started runtime's workspace, creating parent dirs."""
 
     # --- networking ---
 
     @property
     def published_port(self) -> int | None:
-        """A fixed port this runtime exposes to the outside at startup, declared up front to the
-        provider (Modal forwards only ports named at `Sandbox.create`). When set, a server placed
+        """A fixed port this runtime exposes to the outside at startup. When set, a server placed
         here binds it instead of a host-chosen free port, and `expose` returns its public URL.
-        `None` for host-networked runtimes (subprocess/docker), which pick a free port and are
-        reached over the shared host network."""
+        `None` for host-networked runtimes (docker), which pick a free port and are reached over
+        the shared host network."""
         return None
 
     async def expose(self, port: int) -> str | None:
         """Publish a port running *inside this runtime* to a URL reachable from the host/outside,
         or None when local (it's on the host network — reach it at localhost). A remote runtime
-        overrides this with the provider's native port exposure (modal `tunnels()`, prime
-        `client.expose`), torn down with the sandbox in `stop()`. The reverse of `host_endpoint`
-        (which reaches a host port from inside a runtime)."""
+        overrides `_expose` with the provider's native port exposure (prime `client.expose`),
+        torn down with the sandbox in `stop()`. The reverse of `host_endpoint` (which reaches a
+        host port from inside a runtime)."""
+        await self.start()
+        return await self._expose(port)
+
+    async def _expose(self, port: int) -> str | None:
         return None
 
 

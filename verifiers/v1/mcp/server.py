@@ -169,6 +169,8 @@ class ServerBase(Generic[ConfigT, StateT]):
         """A fresh state used outside a tool/respond call (setup, or a manual debug run) — there's
         no channel to sync, so writes to it don't escape the process (matches the no-channel case)."""
         self._state_client: AsyncClient | None = None
+        self._state_url: str | None = None
+        self._state_secret: str = ""
 
     @property
     def state(self) -> StateT:
@@ -183,11 +185,17 @@ class ServerBase(Generic[ConfigT, StateT]):
     def _state_channel(self) -> tuple[str | None, str]:
         """The interception server's state channel `(url, secret)` for the in-flight call: the
         per-rollout coordinates the framework tagged on a `shared` server's URL (read per call from
-        the MCP request), else the per-process channel it set in the environment (a per-rollout
-        server), else `(None, "")` (no channel — a manual debug run)."""
-        url = _request_query(STATE_URL_PARAM) or os.environ.get("VF_STATE_URL")
-        secret = _request_query(STATE_SECRET_PARAM) or os.environ.get(
-            "VF_STATE_SECRET", ""
+        the MCP request), else the per-instance / per-process channel set at launch, else
+        `(None, "")` (no channel — a manual debug run)."""
+        url = (
+            _request_query(STATE_URL_PARAM)
+            or self._state_url
+            or os.environ.get("VF_STATE_URL")
+        )
+        secret = (
+            _request_query(STATE_SECRET_PARAM)
+            or self._state_secret
+            or os.environ.get("VF_STATE_SECRET", "")
         )
         return url, secret
 
@@ -301,44 +309,12 @@ class ServerBase(Generic[ConfigT, StateT]):
     def _register(self, mcp: FastMCP) -> None:
         raise NotImplementedError
 
-    def _serve(self) -> None:
-        """Run this server's MCP server: bind its port, `setup` (always) + `setup_task` for the
-        rollout's task (fetched from the interception `/task` channel — skipped for a shared server,
-        which has no channel), build a FastMCP from the registered tools, and serve it over streamable
-        HTTP on `MCP_HOST`. Called by `run()`."""
-        import asyncio
-        import socket
-        from pathlib import Path
-
-        import uvicorn
+    def _build_app(self):
         from mcp.server.fastmcp import FastMCP
-
-        _die_with_parent()  # never outlive the launcher that started us, even if it skips cleanup
-        host = os.environ.get("MCP_HOST", "127.0.0.1")
-        # Bind our own socket up front: `MCP_PORT` when the framework fixed one (a self-publishing
-        # runtime's forwarded port), else 0 = an OS-assigned free port — guaranteed free in whatever
-        # environment we run in (host or sandbox), so the launcher never probes for a free port.
-        # Report the bound port back via `MCP_PORT_FILE` before setup, so the launcher learns it
-        # without waiting on a slow `setup` (its readiness probe absorbs that).
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, int(os.environ.get("MCP_PORT", 0))))
-        port_file = os.environ.get("MCP_PORT_FILE")
-        if port_file:
-            Path(port_file).write_text(str(sock.getsockname()[1]))
-
-        async def _setup() -> None:
-            await self.setup()
-            # Per-rollout servers carry the rollout's state channel in their env; fetch this rollout's
-            # task over it and run `setup_task`. A shared server has no env channel, so this is a
-            # no-op for it (it's task-agnostic — one instance for the whole eval).
-            await self._setup_task_from_channel(*self._state_channel())
-
-        asyncio.run(_setup())
-        # Relax FastMCP's DNS-rebinding guard: it 421s a non-localhost Host, but our servers are
-        # reached only by our own harness over localhost or a tunnel (never a browser).
         from mcp.server.transport_security import TransportSecuritySettings
 
+        # Relax FastMCP's DNS-rebinding guard: it 421s a non-localhost Host, but our servers are
+        # reached only by our own harness over localhost or a tunnel (never a browser).
         security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
         # Short vf-native rollouts do tiny tool calls; stateless JSON avoids FastMCP's
         # session/SSE overhead while keeping the same MCP initialize/list/call flow.
@@ -346,6 +322,7 @@ class ServerBase(Generic[ConfigT, StateT]):
             self.server_name,
             json_response=True,
             stateless_http=True,
+            log_level="ERROR",
             transport_security=security,
         )
         self._register(mcp)
@@ -367,7 +344,96 @@ class ServerBase(Generic[ConfigT, StateT]):
                 self._state_client = None
 
         app.router.lifespan_context = serving_lifespan
-        server = uvicorn.Server(uvicorn.Config(app, log_level="critical"))
+        return app
+
+    @contextlib.asynccontextmanager
+    async def serve_in_process(
+        self,
+        task=None,
+        *,
+        state_url: str | None = None,
+        state_secret: str = "",
+    ):
+        """Serve this MCP server in-process on an ephemeral localhost port in the active event
+        loop — no subprocess or container spawned — and tear it down cleanly on exit."""
+        import asyncio
+        import socket
+
+        import uvicorn
+
+        ready = asyncio.Event()
+        stop = asyncio.Event()
+
+        class _InProcessServer(uvicorn.Server):
+            def install_signal_handlers(self) -> None:
+                pass
+
+            async def main_loop(self) -> None:
+                ready.set()
+                await stop.wait()
+                self.should_exit = True
+
+        self._state_url = state_url
+        self._state_secret = state_secret
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        try:
+            await self.setup()
+            if task is not None:
+                await self.setup_task(task)
+            server = _InProcessServer(
+                uvicorn.Config(
+                    self._build_app(), log_level="critical", date_header=False
+                )
+            )
+            serve_task = asyncio.create_task(server.serve(sockets=[sock]))
+            serve_task.add_done_callback(lambda _: ready.set())
+            await ready.wait()
+            if serve_task.done():
+                serve_task.result()
+            try:
+                yield port
+            finally:
+                stop.set()
+                server.should_exit = True
+                try:
+                    await asyncio.shield(serve_task)
+                except asyncio.CancelledError:
+                    serve_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await serve_task
+                    raise
+        finally:
+            sock.close()
+
+    def _serve(self) -> None:
+        """Run this server's MCP server in a standalone process: bind its port, `setup` (always) +
+        `setup_task` for the rollout's task (fetched from the interception `/task` channel —
+        skipped for a shared server, which has no channel), build a FastMCP from the registered
+        tools, and serve it over streamable HTTP on `MCP_HOST`. Called by `run()`."""
+        import asyncio
+        import socket
+        from pathlib import Path
+
+        import uvicorn
+
+        _die_with_parent()  # never outlive the launcher that started us, even if it skips cleanup
+        host = os.environ.get("MCP_HOST", "127.0.0.1")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, int(os.environ.get("MCP_PORT", 0))))
+        port_file = os.environ.get("MCP_PORT_FILE")
+        if port_file:
+            Path(port_file).write_text(str(sock.getsockname()[1]))
+
+        async def _setup() -> None:
+            await self.setup()
+            await self._setup_task_from_channel(*self._state_channel())
+
+        asyncio.run(_setup())
+        server = uvicorn.Server(uvicorn.Config(self._build_app(), log_level="critical"))
         asyncio.run(server.serve(sockets=[sock]))
 
     @classmethod

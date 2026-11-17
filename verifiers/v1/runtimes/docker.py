@@ -10,7 +10,7 @@ import logging
 import shlex
 import subprocess
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic_config import BaseConfig
 
@@ -24,7 +24,7 @@ class DockerConfig(BaseConfig):
     type: Literal["docker"] = "docker"
     image: str = "python:3.11-slim"
     workdir: str = "/app"
-    # TaskResources in Modal's units (also settable per-task via Task.resources).
+    # TaskResources (also settable per-task via Task.resources).
     cpu: float | None = None
     """Pin the container to this many CPU cores (docker `--cpus`). None = unlimited."""
     memory: float | None = None
@@ -56,6 +56,8 @@ async def docker(*args: str) -> ProgramResult:
 class DockerRuntime(Runtime):
     """Runs the program in a local Docker container reachable over the host network."""
 
+    _daemon_verified: ClassVar[bool] = False
+
     def __init__(self, config: DockerConfig, name: str | None = None) -> None:
         super().__init__(name)
         self.config = config
@@ -67,25 +69,28 @@ class DockerRuntime(Runtime):
     def descriptor(self) -> str | None:
         return self._container_id
 
-    async def start(self) -> None:
-        try:
-            version = await docker("version", "--format", "{{.Server.Version}}")
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                "docker runtime selected but the `docker` CLI is not installed"
-            ) from e
-        if version.exit_code != 0:
-            detail = (version.stderr or version.stdout).strip()
-            hint = ""
-            if "permission denied" in detail.lower():
-                hint = (
-                    "\nYour user isn't in the `docker` group. Either run the command "
-                    'under `sg docker -c "..."`, or add yourself with '
-                    "`sudo usermod -aG docker $USER` and start a new login shell."
+    async def _start(self) -> None:
+        if not DockerRuntime._daemon_verified:
+            try:
+                version = await docker("version", "--format", "{{.Server.Version}}")
+            except FileNotFoundError as e:
+                raise SandboxError(
+                    "docker runtime selected but the `docker` CLI is not installed "
+                    "(install Docker locally, or pass --harness.runtime.type prime)"
+                ) from e
+            if version.exit_code != 0:
+                detail = (version.stderr or version.stdout).strip()
+                hint = ""
+                if "permission denied" in detail.lower():
+                    hint = (
+                        "\nYour user isn't in the `docker` group. Either run the command "
+                        'under `sg docker -c "..."`, or add yourself with '
+                        "`sudo usermod -aG docker $USER` and start a new login shell."
+                    )
+                raise SandboxError(
+                    f"docker runtime selected but the Docker daemon is not reachable: {detail}{hint}"
                 )
-            raise RuntimeError(
-                f"docker runtime selected but the Docker daemon is not reachable: {detail}{hint}"
-            )
+            DockerRuntime._daemon_verified = True
         self._container = self.name
         limits: list[str] = []
         if self.config.cpu is not None:
@@ -120,15 +125,17 @@ class DockerRuntime(Runtime):
             self.config.image,
         )
 
-    async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+    async def _run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        assert self._container is not None
         env_args = [arg for k, v in env.items() for arg in ("--env", f"{k}={v}")]
         return await docker(
             "exec", *env_args, "--workdir", self.config.workdir, self._container, *argv
         )
 
-    async def run_background(
+    async def _run_background(
         self, argv: list[str], env: dict[str, str], log: str
     ) -> None:
+        assert self._container is not None
         env_args = [arg for k, v in env.items() for arg in ("--env", f"{k}={v}")]
         inner = f"{' '.join(shlex.quote(a) for a in argv)} > {shlex.quote(log)} 2>&1"
         run = await docker(
@@ -145,7 +152,8 @@ class DockerRuntime(Runtime):
         if run.exit_code != 0:
             raise SandboxError(f"docker exec -d failed: {run.stderr.strip()}")
 
-    async def read(self, path: str) -> bytes:
+    async def _read(self, path: str) -> bytes:
+        assert self._container is not None
         proc = await asyncio.create_subprocess_exec(
             "docker",
             "exec",
@@ -164,7 +172,8 @@ class DockerRuntime(Runtime):
             )
         return stdout
 
-    async def write(self, path: str, data: bytes) -> None:
+    async def _write(self, path: str, data: bytes) -> None:
+        assert self._container is not None
         parent = shlex.quote(str(PurePosixPath(path).parent))
         proc = await asyncio.create_subprocess_exec(
             "docker",

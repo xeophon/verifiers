@@ -80,8 +80,6 @@ class LeanConfig(TasksetConfig):
 
 
 class LeanTaskset(Taskset[LeanTask, LeanConfig]):
-    NEEDS_CONTAINER = True
-
     # ---- task loading -------------------------------------------------------
 
     def load_tasks(self) -> list[LeanTask]:

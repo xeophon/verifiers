@@ -13,7 +13,7 @@ from pydantic_config import BaseConfig
 
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.mcp.server import ConfigT, ServerBase
-from verifiers.v1.runtimes import RuntimeConfig, SubprocessConfig
+from verifiers.v1.runtimes import RuntimeConfig
 from verifiers.v1.state import StateT
 
 if TYPE_CHECKING:
@@ -21,17 +21,16 @@ if TYPE_CHECKING:
 
 
 class ToolsetConfig(BaseConfig):
-    """Where one tool server runs (placement). The default — its own host (`subprocess`)
-    runtime — is the cheap one: the server runs in the eval process's environment, where
-    `verifiers` and the env module are already installed (nothing to fetch), and the harness
-    reaches it over the host network (docker `--network host`) or a tunnel (prime). `colocated`
-    and `shared` trade that off:
-      - neither (default): its own `runtime`, per rollout (host by default).
-      - colocated: in the harness's OWN runtime, per rollout (no tunnel). In a sandbox this means
-        the `verifiers` source + the env module are uploaded and `uv pip install`ed there, so it
-        costs a per-rollout install.
-      - shared: one instance for the whole eval, in its own `runtime` (pays `setup` once; per-rollout
-        writable state stays isolated via `self.state`).
+    """Where one tool server runs (placement). The default — in-process on the host (`runtime=None`)
+    — is the cheap one: the server runs inside the eval/worker event loop where `verifiers` and the
+    env module are already loaded (no container or subprocess to spawn), and the harness reaches it
+    over localhost or a tunnel. `colocated`, `shared`, and `runtime` trade that off:
+      - default (`runtime=None`, `colocated=False`, `shared=False`): in-process on the host, per rollout.
+      - `runtime={type="docker"|"prime"}`: its own isolated container/sandbox, per rollout.
+      - `colocated=True`: inside the harness's OWN runtime, per rollout (uploads + installs `verifiers`
+        and the env module in the sandbox).
+      - `shared=True`: one instance for the whole eval (in-process on the host by default, or in its
+        own `runtime`; per-rollout writable state stays isolated via `self.state`).
     See the placement/isolation section of `verifiers/v1/GUIDE.md` for the trade-offs of each.
     Subclass to add the server's own knobs (the data its `@tool` methods read). The server name is
     the class's `TOOL_PREFIX` ClassVar, not a field here — it's an identity (the model sees
@@ -39,19 +38,17 @@ class ToolsetConfig(BaseConfig):
 
     colocated: bool = False
     """Run the server inside the harness's runtime (reached in-sandbox, no tunnel). Off by
-    default — on the host it's free, but in a sandbox the harness runtime must install the env
-    package + `verifiers` (a per-rollout cost), so prefer the default own-runtime placement
-    unless co-locating genuinely helps."""
+    default — in a sandbox the harness runtime must install the env package + `verifiers` (a
+    per-rollout cost), so prefer the default host placement unless co-locating genuinely helps."""
     shared: bool = False
-    """Run one server instance for the whole eval, shared across rollouts (in its own `runtime`) —
-    pays an expensive `setup` (a corpus/index) once. It may still be writable: each rollout reads and
-    writes its OWN `self.state` (the framework tags the per-rollout state channel onto the shared
-    server's URL), so concurrent rollouts don't corrupt each other — provided the shared server runs
-    on a local runtime (the default), which can reach the host's interception server. Mutually
-    exclusive with `colocated`."""
-    runtime: RuntimeConfig = SubprocessConfig()
-    """The server's own runtime, used unless `colocated` (host/subprocess by default — always
-    reachable from any harness runtime; set docker/prime to isolate it in its own sandbox)."""
+    """Run one server instance for the whole eval, shared across rollouts (on the host by default,
+    or in its own `runtime`) — pays an expensive `setup` (a corpus/index) once. It may still be
+    writable: each rollout reads and writes its OWN `self.state` (the framework tags the per-rollout
+    state channel onto the shared server's URL), so concurrent rollouts don't corrupt each other.
+    Mutually exclusive with `colocated`."""
+    runtime: RuntimeConfig | None = None
+    """An isolated container/sandbox runtime (`docker` / `prime`) for this server, used
+    unless `colocated`. `None` (default) runs the server in-process on the host."""
     url: str | None = None
     """An already-running streamable-HTTP MCP endpoint to connect to instead of launching a
     server (e.g. a public remote like DeepWiki). When set, placement is ignored — the toolset

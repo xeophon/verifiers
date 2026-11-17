@@ -17,7 +17,7 @@ For a heterogeneous taskset (different verification per task), have a single
 
 import asyncio
 from collections.abc import Mapping
-from typing import ClassVar, Generic, TypeVar
+from typing import Generic, TypeVar
 
 from pydantic_config import BaseConfig
 
@@ -54,11 +54,6 @@ class Taskset(Generic[TaskT, ConfigT, StateT]):
     `load_tasks`, and the trace's `state` are fully typed. `StateT` defaults to the base `State`, so a
     taskset that doesn't customize state writes just `Taskset[MyTask, MyConfig]`. Subclass: implement
     `load_tasks`, add @reward/@metric."""
-
-    NEEDS_CONTAINER: ClassVar[bool] = False
-    """Whether this taskset only runs in a container runtime (docker/prime). When True the
-    Environment refuses the subprocess runtime — for tasksets whose work only makes sense
-    inside a per-task image (e.g. a SWE repo sandbox)."""
 
     def __init__(self, config: ConfigT) -> None:
         self.config = config

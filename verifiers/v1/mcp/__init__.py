@@ -7,6 +7,11 @@ rollout's tools / the eval's shared tools / the user sim), and `connect_user` (t
 framework drives the user sim through).
 """
 
+from verifiers.v1.mcp.client import (
+    call_mcp,
+    connect_mcp,
+    mcp_content_to_chat_content,
+)
 from verifiers.v1.mcp.launch import (
     Respond,
     connect_user,
@@ -26,7 +31,10 @@ __all__ = [
     "User",
     "UserConfig",
     "Respond",
+    "call_mcp",
+    "connect_mcp",
     "connect_user",
+    "mcp_content_to_chat_content",
     "serve",
     "serve_shared",
     "serve_tools",

@@ -100,9 +100,6 @@ harbor = [
     # Harbor currently publishes Python 3.12+ packages; keep core verifiers installable on 3.11.
     "harbor==0.14.0; python_version >= '3.12'",
 ]
-modal = [
-    "modal>=1.4.0",
-]
 notebook = [
     "nest-asyncio>=1.6.0",
 ]
@@ -243,10 +240,9 @@ markers = [
     "slow: marks slow-running tests (deselect with -m 'not slow')",
     # v1 e2e matrix axes — select subsets with `-m` (see tests/v1/conftest.py). A mark is applied
     # per axis, so it matches every case touching that value on any axis.
-    "subprocess: v1 e2e cases touching the subprocess (host) runtime",
+    "host: v1 e2e cases with a user/tool server running in-process on the host",
     "docker: v1 e2e cases touching the docker runtime",
     "prime: v1 e2e cases touching the prime runtime (real sandbox + tunnel; local-only, excluded in CI)",
-    "modal: v1 e2e cases touching the modal runtime (local-only setup; excluded in CI)",
     "colocated: v1 e2e cases with a user/tool server colocated in the harness runtime",
     "shared: v1 e2e cases with a shared (one-per-eval) tool server",
     "null: v1 e2e cases on the null harness",

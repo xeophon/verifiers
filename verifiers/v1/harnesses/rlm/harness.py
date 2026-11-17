@@ -104,7 +104,7 @@ class RLMHarness(Harness[RLMHarnessConfig]):
     def summarize_threshold(self, task_idx: int) -> str:
         """The `RLM_SUMMARIZE_AT_TOKENS` value: a range draws per-group (seeded by task index, so
         a task's rollouts share one threshold). Always set — "" when disabled — so the typed field,
-        not a host var the subprocess runtime would inherit, wins."""
+        not an ambient environment variable in the container, wins."""
         value = self.config.summarize_at_tokens
         if value is None:
             return ""

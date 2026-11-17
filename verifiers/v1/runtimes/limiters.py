@@ -1,7 +1,7 @@
-"""Host-global creation-rate limiters for the remote runtimes.
+"""Host-global creation-rate limiters for remote runtimes.
 
-A leaky bucket backed by a lock file, so a provider's per-account creation rate (Modal
-sandboxes, Prime tunnels) is enforced across EVERY process on the host — the single-process
+A leaky bucket backed by a lock file, so a provider's per-account creation rate (Prime
+sandboxes and tunnels) is enforced across EVERY process on the host — the single-process
 eval and all the elastically-spawned env-server worker processes alike — not just within one
 process. So the configured rate is the actual account-wide rate (assuming one env-server
 host). Keyed by name: one bucket file per name, shared by every process (and run) on the host.
@@ -70,7 +70,7 @@ def creation_limiter(per_sec: float | None, name: str) -> CreationLimiter | None
 
 
 # The prime_tunnel service caps tunnel starts at 512/min per API token — a property of the
-# tunnel service, shared by every runtime that opens a prime_tunnel (prime AND modal). One
+# tunnel service, shared by every runtime that opens a prime_tunnel. One
 # host-global limiter, not a per-runtime config knob.
 _TUNNELS_PER_MIN = 512
 TUNNEL_LIMITER = creation_limiter(_TUNNELS_PER_MIN / 60, "prime-tunnel")
